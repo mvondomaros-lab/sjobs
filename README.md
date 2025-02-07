@@ -1,0 +1,3 @@
+# sjobs
+
+Show Slurm jobs.
