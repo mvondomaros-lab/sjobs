@@ -23,7 +23,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/mvondomaros-lab/sjobs"
-Issues = "https://github.com/mvondomaros-lab/sjobs"
+Issues = "https://github.com/mvondomaros-lab/sjobs/issues"
 CI = "https://github.com/mvondomaros-lab/sjobs/actions"
 
 [project.scripts]
