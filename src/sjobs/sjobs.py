@@ -38,4 +38,4 @@ def main():
     ).sort_values(by="Name")
 
     # Output
-    click.echo(df.to_string(index=False))
+    print(df.to_string(index=False))
