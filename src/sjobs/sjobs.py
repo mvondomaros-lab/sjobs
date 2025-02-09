@@ -1,4 +1,5 @@
 import io
+import os
 import subprocess
 
 import click
@@ -22,7 +23,12 @@ def main():
 
     # Fetch the squeue output.
     stdout = subprocess.run(
-        ["squeue", "-u", "$USER", f"--format='{delimiter.join(fieldcodes.values())}'"],
+        [
+            "squeue",
+            "-u",
+            os.getlogin(),
+            f"--format='{delimiter.join(fieldcodes.values())}'",
+        ],
         capture_output=True,
     ).stdout.decode()
 
