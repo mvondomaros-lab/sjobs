@@ -86,10 +86,8 @@ def main():
         state_str = ",".join(catdict["states"])
         color = catdict["color"]
 
-        stdout = subprocess.run(
-            cmdline + [f"--Format='{format_str}'", f"--states='{state_str}'"],
-            capture_output=True,
-        ).stdout.decode()
+        _cmdline = cmdline + [f"--Format={format_str}", f"--states={state_str}"]
+        stdout = subprocess.run(_cmdline, capture_output=True).stdout.decode()
         jobs = [line.split() for line in stdout.splitlines()]
         if len(jobs) != 1:
             click.echo(click.style(f"[{cat}]", fg=color, bold=True))
