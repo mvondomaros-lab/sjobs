@@ -58,7 +58,7 @@ def main():
         cmdline = []
     else:
         cmdline = ["ssh", "marc3a"]
-    cmdline += ["squeue", "-me"]
+    cmdline += ["squeue", "--me"]
 
     # Fetch job information.
     for cat, catdict in categories.items():
