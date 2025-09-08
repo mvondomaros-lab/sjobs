@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 .idea
+# pixi environments
+.pixi/*
+!.pixi/config.toml
