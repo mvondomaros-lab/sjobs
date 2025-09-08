@@ -1200,8 +1200,8 @@ packages:
   timestamp: 1733301007770
 - pypi: ./
   name: sjobs
-  version: 0.5.0
-  sha256: 8f7d174a3f9fbd535c5492976a84606823f840a12e2f1a763ad84687bdc51981
+  version: 0.5.1
+  sha256: bd1a7f863b97ff42bc8ea944fbeee0aa5ac35f3da1e82303b89fccd0933cc71a
   requires_dist:
   - click>=8.1.8
   - tabulate>=0.9.0
