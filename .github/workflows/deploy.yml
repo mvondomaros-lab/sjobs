@@ -2,14 +2,14 @@ name: Build & Deploy
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, dev ]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: "deploy"
+  group: "deploy-${{ github.ref_name }}"
   cancel-in-progress: true
 
 env:
@@ -39,12 +39,21 @@ jobs:
           cp -v *.conda out/conda/noarch/
           cp -v dist/*.{whl,tar.gz} out/pypi/
 
+      - name: Dry-run summary
+        if: github.ref_name != 'main'
+        run: |
+          echo "Dry run only for branch: ${GITHUB_REF_NAME}"
+          echo "Would publish these artifacts:"
+          find out -type f -print
+
       - name: Prepare Git Identity
+        if: github.ref_name == 'main'
         run: |
           git config --global user.name  "mvondomaros-lab-bot"
           git config --global user.email "actions@github.com"
 
       - name: Push to Pages Repo
+        if: github.ref_name == 'main'
         env:
           PAGES_PUSH_TOKEN: ${{ secrets.PAGES_PUSH_TOKEN }}
         run: |
@@ -64,6 +73,7 @@ jobs:
           git push -u origin HEAD
 
       - name: Open PR to Pages Repo
+        if: github.ref_name == 'main'
         env:
           GH_TOKEN: ${{ secrets.PAGES_PUSH_TOKEN }}
         run: |
