@@ -5,6 +5,7 @@ snapshot. It contains no user job data and also exercises scalar field values.
 """
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -20,8 +21,33 @@ from click.testing import CliRunner
 
 from sjobs import sjobs
 
-SNAPSHOT = (Path(__file__).parent / "fixtures" / "squeue.json").read_text()
+FIXTURES = Path(__file__).parent / "fixtures"
+SNAPSHOT = (FIXTURES / "squeue.json").read_text()
+SSHARE = (FIXTURES / "sshare.txt").read_text()
+SPRIO = (FIXTURES / "sprio.txt").read_text()
 FIXTURE_PREFIXES = ["/scratch_shared/"]
+# Six hours into the fixture's running job (12 h limit).
+NOW = 1794482019
+
+
+def script_output(squeue=SNAPSHOT, sshare=SSHARE, sprio=SPRIO, homes=("/home/a",)):
+    """What the sjobs script prints: home markers, tool sections, squeue JSON."""
+    lines = [f"{sjobs.REMOTE_HOME_MARKER}{home}\n" for home in homes]
+    for name, text in (("sshare", sshare), ("sprio", sprio)):
+        lines.append(f"{sjobs.SECTION_MARKER}{name}\n{text}")
+    lines.append(f"{sjobs.SECTION_MARKER}squeue\n{squeue}")
+    return "".join(lines)
+
+
+def script_of(command):
+    """The shell script inside a local or SSH command line."""
+    if command[0] == "ssh":
+        shell = shlex.split(command[2])
+        assert shell[:2] == ["sh", "-lc"]
+        return shell[2]
+    assert command[:2] == ["sh", "-c"]
+    return command[2]
+
 
 _env_patch = None
 _tmpdir = None
@@ -71,56 +97,104 @@ class CommandTests(unittest.TestCase):
         )
 
     @patch("sjobs.sjobs.shutil.which", return_value="/usr/bin/squeue")
-    def test_local_squeue_needs_no_shell(self, _which):
-        self.assertEqual(sjobs.build_cmdline(), sjobs.build_squeue_args())
+    def test_local_runs_the_same_script(self, _which):
+        command = sjobs.build_cmdline()
+        self.assertEqual(command, ["sh", "-c", sjobs.build_script()])
+        tokens = shlex.split(command[2])
+        self.assertEqual(
+            tokens[tokens.index("--json") - 1 :], sjobs.build_squeue_args()
+        )
+
+    def test_script_has_one_squeue_call_and_it_runs_last(self):
+        for options in ({}, {"show_all": True}, {"username": "bob"}):
+            with self.subTest(**options):
+                script = sjobs.build_script(**options)
+                self.assertEqual(script.count("squeue --json"), 1)
+                self.assertTrue(
+                    script.endswith(shlex.join(sjobs.build_squeue_args(**options)))
+                )
+
+    def test_extra_tools_follow_the_user_filter(self):
+        own = sjobs.build_script()
+        self.assertIn("sshare -P -n -U -o", own)
+        self.assertEqual(own.count('-u "$(id -un)"'), 2)
+        everyone = sjobs.build_script(show_all=True)
+        # Fair share stays your own; priorities cover all pending jobs.
+        self.assertEqual(everyone.count('-u "$(id -un)"'), 1)
+        self.assertEqual(sjobs.build_script(username="bob").count("-u bob"), 2)
 
     @patch("sjobs.sjobs.shutil.which", return_value=None)
     def test_ssh_keeps_user_input_in_one_argument(self, _which):
         username = "alice; echo $(whoami) 'quoted'"
         command = sjobs.build_cmdline(username=username, host="cluster")
         self.assertEqual(command[:2], ["ssh", "cluster"])
-        shell = shlex.split(command[2])
-        self.assertEqual(shell[:2], ["sh", "-lc"])
-        script = shlex.split(shell[2])
+        tokens = shlex.split(script_of(command))
         self.assertEqual(
-            script[script.index("&&") + 1 :],
+            tokens[tokens.index("--json") - 1 :],
             ["squeue", "--json", "--states=all", f"--user={username}"],
         )
+        # sshare and sprio each get the name as one argument after -u.
+        self.assertEqual(
+            [tokens[i + 1] for i, token in enumerate(tokens) if token == "-u"],
+            [username, username],
+        )
+
+    def run_script(self, command, tools=("squeue", "sshare", "sprio")):
+        """Run a command's script in a real sh with fake Slurm tools on PATH.
+
+        Each fake tool records its arguments and prints its fixture.
+        """
+        outputs = {"squeue": '{"jobs": []}', "sshare": SSHARE, "sprio": SPRIO}
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        for tool in tools:
+            (tmp / f"{tool}.out").write_text(outputs[tool])
+            fake = bin_dir / tool
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$@\" > {shlex.quote(str(tmp / tool))}.args\n"
+                f"cat {shlex.quote(str(tmp / tool))}.out\n"
+            )
+            fake.chmod(0o755)
+        env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp)}
+        # ssh hands command[2] to the remote user's shell, like sh -c here.
+        result = subprocess.run(
+            ["sh", "-c", command[2]] if command[0] == "ssh" else command,
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        args = {tool: (tmp / f"{tool}.args").read_text().splitlines() for tool in tools}
+        return tmp, result.stdout, args
 
     @patch("sjobs.sjobs.shutil.which", return_value=None)
     def test_remote_script_runs_in_a_real_shell(self, _which):
-        """Run the remote command through sh with a fake squeue on PATH."""
         username = "alice; echo $(whoami) 'quoted' \"x\""
         command = sjobs.build_cmdline(username=username, host="cluster")
-        with tempfile.TemporaryDirectory() as tmp:
-            bin_dir = Path(tmp) / "bin"
-            bin_dir.mkdir()
-            args_file = Path(tmp) / "args"
-            fake = bin_dir / "squeue"
-            fake.write_text(
-                "#!/bin/sh\n"
-                f"printf '%s\\n' \"$@\" > {shlex.quote(str(args_file))}\n"
-                "printf '{\"jobs\": []}'\n"
-            )
-            fake.chmod(0o755)
-            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": tmp}
-            # ssh hands command[2] to the remote user's shell, like sh -c here.
-            result = subprocess.run(
-                ["sh", "-c", command[2]],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            homes, stdout = sjobs.split_remote_output(result.stdout)
-            self.assertEqual(
-                homes, list(dict.fromkeys([tmp, str(Path(tmp).resolve())]))
-            )
-            self.assertEqual(sjobs.parse_squeue_json(stdout), [])
-            self.assertEqual(
-                args_file.read_text().splitlines(),
-                ["--json", "--states=all", f"--user={username}"],
-            )
+        tmp, stdout, args = self.run_script(command)
+        homes, sections, json_text = sjobs.split_sections(stdout)
+        self.assertEqual(homes, list(dict.fromkeys([str(tmp), str(tmp.resolve())])))
+        self.assertEqual(sections, {"sshare": SSHARE, "sprio": SPRIO})
+        self.assertEqual(sjobs.parse_squeue_json(json_text), [])
+        self.assertEqual(
+            args["squeue"], ["--json", "--states=all", f"--user={username}"]
+        )
+        self.assertEqual(args["sshare"][-2:], ["-u", username])
+        self.assertEqual(
+            args["sprio"], ["-h", "-o", sjobs.SPRIO_FORMAT, "-u", username]
+        )
+
+    @patch("sjobs.sjobs.shutil.which", return_value="/usr/bin/squeue")
+    def test_missing_extra_tools_leave_squeue_working(self, _which):
+        _tmp, stdout, _args = self.run_script(sjobs.build_cmdline(), tools=("squeue",))
+        _homes, sections, json_text = sjobs.split_sections(stdout)
+        self.assertEqual(sjobs.parse_squeue_json(json_text), [])
+        self.assertEqual(
+            sjobs.parse_sshare(sections["sshare"]), ([], "sshare not found")
+        )
+        self.assertEqual(sjobs.parse_sprio(sections["sprio"]), ({}, "sprio not found"))
 
     @patch("sjobs.sjobs.shutil.which", return_value="/usr/bin/squeue")
     def test_explicit_host_uses_ssh_even_with_local_squeue(self, _which):
@@ -178,12 +252,12 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(sjobs.shorten_path("/other/a", prefixes), "/other/a")
 
 
-class RemoteOutputTests(unittest.TestCase):
+class SectionTests(unittest.TestCase):
     def test_marker_lines_carry_logical_and_physical_home(self):
         stdout = 'SJOBS_HOME=/home/alice\nSJOBS_HOME=/nfs/alice\n{"jobs": []}'
         self.assertEqual(
-            sjobs.split_remote_output(stdout),
-            (["/home/alice", "/nfs/alice"], '{"jobs": []}'),
+            sjobs.split_sections(stdout),
+            (["/home/alice", "/nfs/alice"], {}, '{"jobs": []}'),
         )
 
     def test_profile_noise_before_the_markers_is_dropped(self):
@@ -191,15 +265,137 @@ class RemoteOutputTests(unittest.TestCase):
             'Welcome!\nSJOBS_HOME=/home/alice\r\nSJOBS_HOME=/home/alice\n{"jobs": []}\n'
         )
         self.assertEqual(
-            sjobs.split_remote_output(stdout), (["/home/alice"], '{"jobs": []}\n')
+            sjobs.split_sections(stdout), (["/home/alice"], {}, '{"jobs": []}\n')
         )
 
     def test_missing_marker_or_empty_home(self):
+        self.assertEqual(sjobs.split_sections('{"jobs": []}'), ([], {}, '{"jobs": []}'))
         self.assertEqual(
-            sjobs.split_remote_output('{"jobs": []}'), ([], '{"jobs": []}')
+            sjobs.split_sections("SJOBS_HOME=\nSJOBS_HOME=\n{}"), ([], {}, "{}")
         )
+
+    def test_tool_sections_and_squeue_json(self):
+        stdout = script_output(squeue='{"jobs": []}\nSJOBS_SECTION=fake\n')
+        homes, sections, json_text = sjobs.split_sections(stdout)
+        self.assertEqual(homes, ["/home/a"])
+        self.assertEqual(sections, {"sshare": SSHARE, "sprio": SPRIO})
+        # Nothing after the squeue marker is read as a marker.
+        self.assertEqual(json_text, '{"jobs": []}\nSJOBS_SECTION=fake\n')
+
+
+class ExtraToolTests(unittest.TestCase):
+    def test_sshare_rows(self):
+        rows, problem = sjobs.parse_sshare(SSHARE)
+        self.assertIsNone(problem)
         self.assertEqual(
-            sjobs.split_remote_output("SJOBS_HOME=\nSJOBS_HOME=\n{}"), ([], "{}")
+            rows,
+            [
+                {
+                    "account": "acct_a",
+                    "user": "alice",
+                    "norm_shares": 0.2,
+                    "usage": 0.332631,
+                    "fairshare": 0.016209,
+                }
+            ],
+        )
+
+    def test_unusable_output_becomes_a_problem_not_an_error(self):
+        for parse in (sjobs.parse_sshare, sjobs.parse_sprio):
+            with self.subTest(parse=parse.__name__):
+                empty, problem = parse(
+                    "\n  sshare: error: Problem talking to slurmdbd\n"
+                )
+                self.assertFalse(empty)
+                self.assertEqual(problem, "sshare: error: Problem talking to slurmdbd")
+                self.assertEqual(parse("")[1], None)
+                self.assertEqual(parse(None)[1], None)
+        # Rows without a user (account lines) or with bad numbers are skipped.
+        self.assertEqual(
+            sjobs.parse_sshare("acct||1|0.2|1|0.1|0.5\nacct|u|1|x|1|0.1|0.5\n")[0], []
+        )
+
+    def test_sprio_keeps_the_best_partition(self):
+        priorities, problem = sjobs.parse_sprio(SPRIO + "garbage|line\n")
+        self.assertIsNone(problem)
+        self.assertEqual(
+            priorities,
+            {
+                1200: {
+                    "priority": 5000.0,
+                    "factors": {
+                        "age": 1000.0,
+                        "fs": 3000.0,
+                        "size": 0.0,
+                        "part": 1000.0,
+                        "qos": 0.0,
+                        "tres": 0.0,
+                    },
+                }
+            },
+        )
+
+    def test_sprio_tres_and_array_ids(self):
+        priorities, _ = sjobs.parse_sprio(
+            "1100_[1-4]|a|p|30|10|0|0|0|0|cpu=15,mem=5|0\n"
+        )
+        self.assertEqual(priorities[1100]["factors"]["tres"], 20.0)
+
+    def test_factor_shares_largest_first(self):
+        self.assertEqual(
+            sjobs.format_factors({"age": 100000, "fs": 62, "part": 33333, "qos": 0}),
+            "age 75% part 25%",
+        )
+        self.assertEqual(sjobs.format_factors({"age": 0, "fs": 0}), "")
+
+
+class TimeTests(unittest.TestCase):
+    def test_durations(self):
+        for seconds, expected in (
+            (None, ""),
+            (0, "0m"),
+            (-5, "0m"),
+            (59, "0m"),
+            (45 * 60, "45m"),
+            (3 * 3600 + 12 * 60, "3h12m"),
+            (28 * 3600, "1d04h"),
+            (math.inf, "unlimited"),
+        ):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(sjobs.format_duration(seconds), expected)
+
+    def test_relative_dates(self):
+        now = datetime(2026, 11, 25, 12, 0).timestamp()
+        for when, expected in (
+            (datetime(2026, 11, 25, 18, 5), "today 18:05"),
+            (datetime(2026, 11, 26, 0, 10), "tomorrow 00:10"),
+            (datetime(2026, 11, 24, 9, 0), "yesterday 09:00"),
+            (datetime(2026, 11, 28, 9, 12), "Sat 09:12"),
+            (datetime(2026, 12, 9, 14, 30), "2026-12-09 14:30"),
+        ):
+            with self.subTest(when=when):
+                self.assertEqual(sjobs.format_when(when.timestamp(), now), expected)
+        self.assertEqual(sjobs.format_when(None, now), "")
+
+    def test_ages(self):
+        self.assertEqual(sjobs.format_age(NOW - 7500, NOW), "2h05m ago")
+        self.assertEqual(sjobs.format_age(NOW + 60, NOW), "")
+        self.assertEqual(sjobs.format_age(None, NOW), "")
+
+    def test_progress_bar(self):
+        self.assertEqual(sjobs.progress_bar(0.25), "██░░░░░░  25%")
+        self.assertEqual(sjobs.progress_bar(1.5), "████████ 100%")
+        self.assertEqual(sjobs.progress_bar(-1), "░░░░░░░░   0%")
+
+    def test_time_limits(self):
+        self.assertEqual(sjobs.time_limit_seconds(60), 3600)
+        self.assertEqual(
+            sjobs.time_limit_seconds({"set": True, "infinite": True, "number": 0}),
+            math.inf,
+        )
+        self.assertIsNone(sjobs.time_limit_seconds(None))
+        self.assertIsNone(
+            sjobs.time_limit_seconds({"set": False, "infinite": False, "number": 0})
         )
 
 
@@ -275,6 +471,56 @@ class JobTests(unittest.TestCase):
         self.assertEqual(pending["dependency"], "afterok:1000_*")
         self.assertEqual(regular["job_id"], "1200")
         self.assertEqual(sjobs.classify_job(completing), "OTHER")
+
+    def test_running_and_pending_times_and_priority(self):
+        priorities, _ = sjobs.parse_sprio(SPRIO)
+        running, array, queued, _completing = [
+            sjobs.normalize_job(job, FIXTURE_PREFIXES, NOW, priorities)
+            for job in sjobs.parse_squeue_json(SNAPSHOT)
+        ]
+        self.assertEqual(running["name"], "md run")
+        self.assertEqual(running["user"], "alice")
+        self.assertEqual(running["elapsed"], "6h00m")
+        self.assertEqual(running["progress"], "████░░░░  50%")
+        self.assertEqual(running["time_left"], "6h00m")
+        self.assertEqual(running["_cpus"], 16)
+        self.assertEqual(running["_gpus"], 1)
+        self.assertEqual(queued["submitted"], "1h56m ago")
+        self.assertEqual(queued["est_start"], sjobs.format_when(1794485619, NOW))
+        # sprio's best partition wins over squeue's own priority.
+        self.assertEqual(queued["priority"], "5000")
+        self.assertEqual(queued["factors"], "fs 60% age 20% part 20%")
+        # Without sprio data, squeue's priority is shown and no factors.
+        self.assertEqual(
+            sjobs.normalize_job(sjobs.parse_squeue_json(SNAPSHOT)[2], now=NOW)[
+                "priority"
+            ],
+            "4000",
+        )
+        self.assertEqual(array["priority"], "")
+        self.assertEqual(array["est_start"], "")
+
+    def test_past_start_time_is_not_an_estimate(self):
+        job = sjobs.normalize_job(
+            {"job_state": ["PENDING"], "start_time": NOW - 60}, now=NOW
+        )
+        self.assertEqual(job["est_start"], "")
+
+    def test_unlimited_and_unknown_time_limits(self):
+        unlimited = sjobs.normalize_job(
+            {
+                "job_state": ["RUNNING"],
+                "start_time": NOW - 3600,
+                "time_limit": {"set": True, "infinite": True, "number": 0},
+            },
+            now=NOW,
+        )
+        self.assertEqual(
+            (unlimited["elapsed"], unlimited["progress"], unlimited["time_left"]),
+            ("1h00m", "", "unlimited"),
+        )
+        bare = sjobs.normalize_job({"job_state": ["RUNNING"]}, now=NOW)
+        self.assertEqual((bare["elapsed"], bare["time_left"]), ("", ""))
 
     def test_scalar_array_identifiers(self):
         job = {"job_id": 1005, "array_job_id": 1000, "array_task_id": 4}
@@ -468,6 +714,69 @@ class RenderTests(unittest.TestCase):
         order = [job["job_id"] for job in sjobs.sort_jobs("PENDING", jobs)]
         self.assertEqual(order, ["2", "1"])
 
+    def test_pending_jobs_sort_by_priority_then_submit_time(self):
+        jobs = [
+            sjobs.normalize_job({"job_id": 1, "submit_time": 10}),
+            sjobs.normalize_job({"job_id": 2, "submit_time": 30, "priority": 900}),
+            sjobs.normalize_job({"job_id": 3, "submit_time": 20, "priority": 900}),
+            sjobs.normalize_job({"job_id": 4, "submit_time": 40, "priority": 5000}),
+        ]
+        order = [job["job_id"] for job in sjobs.sort_jobs("PENDING", jobs)]
+        self.assertEqual(order, ["4", "3", "2", "1"])
+
+    def test_long_names_are_always_capped(self):
+        job = sjobs.normalize_job({"job_id": 1, "name": "n" * 80})
+        self.assertIn(
+            "n" * (sjobs.MAX_NAME_WIDTH - 1) + "…", sjobs.fit_table("OTHER", [job])
+        )
+        self.assertNotIn("n" * sjobs.MAX_NAME_WIDTH, sjobs.fit_table("OTHER", [job]))
+
+    def test_user_column_only_when_requested(self):
+        job = sjobs.normalize_job({"job_id": 1, "name": "x", "user_name": "bob"})
+        self.assertNotIn("User", sjobs.fit_table("RUNNING", [job]))
+        table = sjobs.fit_table("RUNNING", [job], show_user=True)
+        header = table.splitlines()[0].split()
+        self.assertEqual(header[:4], ["Job", "ID", "Name", "User"])
+        self.assertIn("bob", table)
+
+    def test_summary_counts_totals_and_fair_share(self):
+        snapshot = {
+            "jobs": [
+                sjobs.normalize_job(job, now=NOW)
+                for job in sjobs.parse_squeue_json(SNAPSHOT)
+            ],
+            "shares": sjobs.parse_sshare(SSHARE)[0],
+            "problems": {"sshare": None, "sprio": None},
+        }
+        frame = click.unstyle(sjobs.render_frame(snapshot, "cluster", NOW))
+        first = frame.splitlines()[0]
+        self.assertIn("sjobs · cluster · ", first)
+        self.assertIn("1 running (16 CPUs, 1 GPU) · 2 pending · 1 other", first)
+        self.assertIn("Fair share  acct_a  0.016  (usage 33.3% vs. 20.0% share)", frame)
+        shown = sjobs.render_frame(snapshot, "cluster", NOW, show_user=True)
+        self.assertIn("alice@acct_a", click.unstyle(shown))
+
+    def test_fair_share_colors(self):
+        self.assertEqual(
+            [sjobs.fairshare_color(v) for v in (0.9, 0.5, 0.3, 0.01)],
+            ["green", "green", "yellow", "red"],
+        )
+
+    def test_missing_data_notes(self):
+        pending = sjobs.normalize_job({"job_state": ["PENDING"]}, now=NOW)
+        problems = {"sshare": "sshare not found", "sprio": "sprio not found"}
+        frame = sjobs.render_frame(
+            {"jobs": [pending], "shares": [], "problems": problems}, now=NOW
+        )
+        self.assertIn("fair share unavailable: sshare not found", frame)
+        self.assertIn("priority factors unavailable: sprio not found", frame)
+        # sprio complains when nothing is pending; that is not worth a note.
+        quiet = sjobs.render_frame(
+            {"jobs": [], "shares": [], "problems": problems}, now=NOW
+        )
+        self.assertNotIn("priority factors", quiet)
+        self.assertIn("no jobs", quiet)
+
     def test_cwd_is_kept_whole_until_rendering(self):
         job = self.running(1, 100, cwd="/x/" + "d" * 80)
         self.assertEqual(len(job["cwd"]), 83)
@@ -538,14 +847,20 @@ class CliTests(unittest.TestCase):
     @patch("sjobs.sjobs.subprocess.run")
     @patch("sjobs.sjobs.shutil.which", return_value=None)
     def test_one_fetch_renders_all_categories_and_preserves_text(self, _which, run):
-        run.return_value = subprocess.CompletedProcess([], 0, stdout=SNAPSHOT)
+        run.return_value = subprocess.CompletedProcess([], 0, stdout=script_output())
         config = 'host = "cluster"\npath_prefixes = ["/scratch_shared"]\n'
         with write_config(config):
             result = self.runner.invoke(sjobs.main)
         self.assertEqual(result.exit_code, 0, result.output)
+        # One process (one SSH round trip) with exactly one squeue call in it.
         run.assert_called_once()
         self.assertEqual(run.call_args.args[0][:2], ["ssh", "cluster"])
+        self.assertEqual(script_of(run.call_args.args[0]).count("squeue --json"), 1)
         for text in (
+            "sjobs · cluster · ",
+            "Fair share  acct_a  0.016",
+            "md run",
+            "fs 60% age 20% part 20%",
             ">>> RUNNING (1)",
             ">>> PENDING (2)",
             ">>> OTHER (1)",
@@ -564,6 +879,46 @@ class CliTests(unittest.TestCase):
         result = self.runner.invoke(sjobs.main)
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertNotIn(">>>", result.output)
+        self.assertIn("no jobs", result.output)
+
+    @patch("sjobs.sjobs.subprocess.run")
+    def test_all_users_adds_the_user_column(self, run):
+        run.return_value = subprocess.CompletedProcess([], 0, stdout=script_output())
+        result = self.runner.invoke(sjobs.main, ["--all"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("User", result.output)
+        self.assertIn("alice@acct_a", result.output)
+
+    @patch("sjobs.sjobs.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("sjobs.sjobs.subprocess.run")
+    def test_watch_redraws_until_ctrl_c(self, run, sleep):
+        run.return_value = subprocess.CompletedProcess([], 0, stdout=script_output())
+        result = self.runner.invoke(sjobs.main, ["--watch"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        run.assert_called_once()
+        sleep.assert_called_once_with(sjobs.DEFAULT_WATCH_INTERVAL)
+        self.assertEqual(result.output.count(">>> RUNNING"), 1)
+        self.assertIn("refreshing every 60 s · Ctrl-C to quit", result.output)
+
+    @patch("sjobs.sjobs.time.sleep", side_effect=[None, KeyboardInterrupt])
+    @patch("sjobs.sjobs.subprocess.run")
+    def test_watch_shows_errors_and_keeps_going(self, run, sleep):
+        run.side_effect = [
+            subprocess.CalledProcessError(255, ["ssh"], output="", stderr="timeout"),
+            subprocess.CompletedProcess([], 0, stdout=script_output()),
+        ]
+        result = self.runner.invoke(sjobs.main, ["-w", "--interval", "45"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(
+            "Error: Failed to fetch jobs with `squeue`: timeout", result.output
+        )
+        self.assertIn(">>> RUNNING", result.output)
+        self.assertEqual(sleep.call_args.args, (45,))
+
+    def test_watch_interval_has_a_minimum(self):
+        result = self.runner.invoke(sjobs.main, ["-w", "--interval", "5"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("--interval", result.output)
 
     @patch("sjobs.sjobs.subprocess.run", side_effect=FileNotFoundError("ssh missing"))
     def test_missing_executable_has_a_readable_error(self, _run):
