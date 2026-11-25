@@ -113,13 +113,14 @@ class CommandTests(unittest.TestCase):
                 check=True,
             )
             homes, stdout = sjobs.split_remote_output(result.stdout)
-            self.assertEqual(homes, list(dict.fromkeys([tmp, str(Path(tmp).resolve())])))
+            self.assertEqual(
+                homes, list(dict.fromkeys([tmp, str(Path(tmp).resolve())]))
+            )
             self.assertEqual(sjobs.parse_squeue_json(stdout), [])
             self.assertEqual(
                 args_file.read_text().splitlines(),
                 ["--json", "--states=all", f"--user={username}"],
             )
-
 
     @patch("sjobs.sjobs.shutil.which", return_value="/usr/bin/squeue")
     def test_explicit_host_uses_ssh_even_with_local_squeue(self, _which):
@@ -141,9 +142,7 @@ class ConfigTests(unittest.TestCase):
     def test_xdg_config_home_is_respected(self):
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/xdg"}):
             os.environ.pop(sjobs.CONFIG_ENV_VAR)
-            self.assertEqual(
-                sjobs.config_path(), Path("/xdg/sjobs/config.toml")
-            )
+            self.assertEqual(sjobs.config_path(), Path("/xdg/sjobs/config.toml"))
 
     def test_host_precedence_flag_env_file(self):
         with write_config('host = "from-file"\n'):
@@ -171,7 +170,9 @@ class ConfigTests(unittest.TestCase):
     def test_path_prefixes_include_home_and_config(self):
         config = {"path_prefixes": ["/scratch", "/work/"]}
         prefixes = sjobs.path_prefixes(config, ["/home/alice", "/nfs/alice/", "/"])
-        self.assertEqual(prefixes, ["/home/alice/", "/nfs/alice/", "/scratch/", "/work/"])
+        self.assertEqual(
+            prefixes, ["/home/alice/", "/nfs/alice/", "/scratch/", "/work/"]
+        )
         self.assertEqual(sjobs.path_prefixes(config), ["/scratch/", "/work/"])
         self.assertEqual(sjobs.shorten_path("/work/a/b", prefixes), "a/b")
         self.assertEqual(sjobs.shorten_path("/other/a", prefixes), "/other/a")
@@ -187,15 +188,16 @@ class RemoteOutputTests(unittest.TestCase):
 
     def test_profile_noise_before_the_markers_is_dropped(self):
         stdout = (
-            "Welcome!\nSJOBS_HOME=/home/alice\r\nSJOBS_HOME=/home/alice\n"
-            '{"jobs": []}\n'
+            'Welcome!\nSJOBS_HOME=/home/alice\r\nSJOBS_HOME=/home/alice\n{"jobs": []}\n'
         )
         self.assertEqual(
             sjobs.split_remote_output(stdout), (["/home/alice"], '{"jobs": []}\n')
         )
 
     def test_missing_marker_or_empty_home(self):
-        self.assertEqual(sjobs.split_remote_output('{"jobs": []}'), ([], '{"jobs": []}'))
+        self.assertEqual(
+            sjobs.split_remote_output('{"jobs": []}'), ([], '{"jobs": []}')
+        )
         self.assertEqual(
             sjobs.split_remote_output("SJOBS_HOME=\nSJOBS_HOME=\n{}"), ([], "{}")
         )
@@ -431,6 +433,101 @@ class JobTests(unittest.TestCase):
         self.assertEqual(sjobs.format_timestamp(999999999999), "999999999999")
 
 
+class RenderTests(unittest.TestCase):
+    def running(self, job_id, end_time, cwd="run"):
+        return sjobs.normalize_job(
+            {
+                "job_id": job_id,
+                "job_state": ["RUNNING"],
+                "end_time": end_time,
+                "current_working_directory": cwd,
+            },
+            [],
+        )
+
+    def test_running_jobs_sort_by_end_time_then_id_unset_last(self):
+        jobs = [
+            self.running(3, 300),
+            self.running(5, None),
+            self.running(4, 100),
+            self.running(2, 300),
+        ]
+        order = [job["job_id"] for job in sjobs.sort_jobs("RUNNING", jobs)]
+        self.assertEqual(order, ["4", "2", "3", "5"])
+
+    def test_pending_jobs_sort_by_submit_time(self):
+        jobs = [
+            sjobs.normalize_job({"job_id": 1, "submit_time": 20}),
+            sjobs.normalize_job(
+                {
+                    "job_id": 2,
+                    "submit_time": {"set": True, "infinite": False, "number": 10},
+                }
+            ),
+        ]
+        order = [job["job_id"] for job in sjobs.sort_jobs("PENDING", jobs)]
+        self.assertEqual(order, ["2", "1"])
+
+    def test_cwd_is_kept_whole_until_rendering(self):
+        job = self.running(1, 100, cwd="/x/" + "d" * 80)
+        self.assertEqual(len(job["cwd"]), 83)
+        table = sjobs.fit_table("RUNNING", [job])
+        self.assertIn("…" + "d" * (sjobs.MAX_CWD_WIDTH - 1), table)
+
+    def test_table_shrinks_cwd_to_fit_the_terminal(self):
+        jobs = [self.running(1, 100, cwd="/x/" + "d" * 80)]
+        wide = max(map(len, sjobs.fit_table("RUNNING", jobs).splitlines()))
+        fitted = sjobs.fit_table("RUNNING", jobs, max_width=wide - 10)
+        self.assertEqual(max(map(len, fitted.splitlines())), wide - 10)
+
+    def test_cwd_never_shrinks_below_minimum(self):
+        jobs = [self.running(1, 100, cwd="/x/" + "d" * 80)]
+        fitted = sjobs.fit_table("RUNNING", jobs, max_width=10)
+        self.assertIn("…" + "d" * (sjobs.MIN_CWD_WIDTH - 1) + " ", fitted)
+
+    def test_long_job_ids_and_dependencies_shrink_widest_first(self):
+        job = sjobs.normalize_job(
+            {
+                "job_id": 1,
+                "array_job_id": 1000,
+                "array_task_string": ",".join(str(i) for i in range(2, 40, 3)),
+                "job_state": ["PENDING"],
+                "dependency": "afterany:2_*(unfulfilled),afterany:3_*(unfulfilled)",
+            },
+            [],
+        )
+        wide = sjobs.fit_table("PENDING", [job])
+        self.assertIn(job["job_id"], wide)
+        self.assertIn(job["dependency"], wide)
+        width = max(map(len, wide.splitlines())) - 40
+        fitted = sjobs.fit_table("PENDING", [job], max_width=width)
+        self.assertEqual(max(map(len, fitted.splitlines())), width)
+        self.assertRegex(fitted, r"1000_\[2,5,8,[0-9,]*…\]")
+        self.assertIn("afterany:2_*", fitted)
+        self.assertIn("…", fitted.splitlines()[-1].rstrip()[-1])
+
+    def test_job_id_truncation(self):
+        self.assertEqual(sjobs.truncate_job_id("1000_[1-4]", 20), "1000_[1-4]")
+        self.assertEqual(sjobs.truncate_job_id("1000_[1,3,5,7,9]", 12), "1000_[1,3,…]")
+        self.assertEqual(sjobs.truncate_job_id("123456789", 5), "1234…")
+
+    def test_short_tables_are_not_changed(self):
+        jobs = [self.running(1, 100)]
+        self.assertEqual(
+            sjobs.fit_table("RUNNING", jobs, max_width=500),
+            sjobs.fit_table("RUNNING", jobs),
+        )
+
+    @patch("sjobs.sjobs.sys.stdout")
+    def test_width_is_only_used_for_terminals(self, stdout):
+        stdout.isatty.return_value = False
+        self.assertIsNone(sjobs.terminal_width())
+        stdout.isatty.return_value = True
+        with patch("sjobs.sjobs.shutil.get_terminal_size") as size:
+            size.return_value = os.terminal_size((90, 40))
+            self.assertEqual(sjobs.terminal_width(), 90)
+
+
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.runner = CliRunner()
@@ -449,9 +546,9 @@ class CliTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(run.call_args.args[0][:2], ["ssh", "cluster"])
         for text in (
-            ">>> RUNNING",
-            ">>> PENDING",
-            ">>> OTHER",
+            ">>> RUNNING (1)",
+            ">>> PENDING (2)",
+            ">>> OTHER (1)",
             "1000_0",
             "1100_[1-4]",
             "1 x A100 (80GB)",
@@ -515,7 +612,10 @@ class CliTests(unittest.TestCase):
         payload = {
             "jobs": [
                 {"job_state": ["RUNNING"], "current_working_directory": "/u/alice/run"},
-                {"job_state": ["RUNNING"], "current_working_directory": "/nfs/alice/phys"},
+                {
+                    "job_state": ["RUNNING"],
+                    "current_working_directory": "/nfs/alice/phys",
+                },
                 {"job_state": ["RUNNING"], "current_working_directory": local},
             ]
         }

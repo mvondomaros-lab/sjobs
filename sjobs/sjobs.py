@@ -4,6 +4,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tomllib
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,8 @@ import click
 import tabulate
 
 MAX_CWD_WIDTH = 56
+# CWD never shrinks below this when fitting a table to the terminal.
+MIN_CWD_WIDTH = 16
 # Stop a hung SSH connection or squeue instead of leaving it on the login node.
 SQUEUE_TIMEOUT = 60
 SLURM_NO_VAL = 0xFFFFFFFE
@@ -50,6 +53,8 @@ CATEGORIES = {
             ("end_time", "End Time"),
         ],
         "color": "green",
+        # Soonest to finish first.
+        "sort": ("_end_time", "_job_id"),
     },
     "PENDING": {
         "fields": [
@@ -63,6 +68,8 @@ CATEGORIES = {
             ("dependency", "Dependency"),
         ],
         "color": "cyan",
+        # Oldest submission first.
+        "sort": ("_submit_time", "_job_id"),
     },
     "OTHER": {
         "fields": [
@@ -75,6 +82,7 @@ CATEGORIES = {
             ("reason", "Reason"),
         ],
         "color": "red",
+        "sort": ("_job_id",),
     },
 }
 
@@ -103,9 +111,7 @@ def load_config():
 
     host = config.get("host")
     if host is not None and not (isinstance(host, str) and host):
-        raise click.ClickException(
-            f"Config {path}: 'host' must be a non-empty string"
-        )
+        raise click.ClickException(f"Config {path}: 'host' must be a non-empty string")
 
     prefixes = config.get("path_prefixes", [])
     if not (
@@ -352,8 +358,8 @@ def format_value(value):
     return str(value)
 
 
-def shorten_path(path, prefixes=None, max_width=MAX_CWD_WIDTH):
-    """Strip a known prefix, then left-truncate long paths keeping the tail."""
+def strip_prefix(path, prefixes=None):
+    """Remove the longest matching known prefix from a path."""
     path = format_value(path)
 
     if prefixes is None:
@@ -361,13 +367,22 @@ def shorten_path(path, prefixes=None, max_width=MAX_CWD_WIDTH):
 
     for prefix in sorted(prefixes, key=len, reverse=True):
         if path.startswith(prefix):
-            path = path.removeprefix(prefix)
-            break
+            return path.removeprefix(prefix)
 
-    if len(path) <= max_width:
-        return path
+    return path
 
-    return "…" + path[-(max_width - 1) :]
+
+def truncate_left(text, max_width):
+    """Left-truncate text to max_width characters, keeping the tail."""
+    if len(text) <= max_width:
+        return text
+
+    return "…" + text[-(max_width - 1) :]
+
+
+def shorten_path(path, prefixes=None, max_width=MAX_CWD_WIDTH):
+    """Strip a known prefix, then left-truncate long paths keeping the tail."""
+    return truncate_left(strip_prefix(path, prefixes), max_width)
 
 
 def format_gpu_type(gpu_type):
@@ -467,11 +482,27 @@ def format_gpu_requests(job):
     return format_gpu_totals(job.get("tres_req_str"))
 
 
+def sort_number(value):
+    """Return a positive Slurm number for sorting, or infinity if unset."""
+    value = unwrap_slurm_value(value)
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 < value < SLURM_NO_VAL
+    ):
+        return value
+    return float("inf")
+
+
 def normalize_job(job, prefixes=None):
-    """Normalize one squeue JSON job into display fields."""
+    """Normalize one squeue JSON job into display fields.
+
+    `cwd` keeps the full prefix-stripped path; rendering truncates it to fit.
+    Keys starting with an underscore are sort keys, not display fields.
+    """
     return {
         "job_id": format_job_id(job),
-        "cwd": shorten_path(job.get("current_working_directory"), prefixes),
+        "cwd": strip_prefix(job.get("current_working_directory"), prefixes),
         "cpus": format_value(job.get("cpus")),
         "gpus": format_gpu_requests(job),
         "state": primary_state(job),
@@ -481,6 +512,9 @@ def normalize_job(job, prefixes=None):
         "submit_time": format_timestamp(job.get("submit_time")),
         "reason": format_value(job.get("state_reason")),
         "dependency": format_value(job.get("dependency")),
+        "_job_id": sort_number(job.get("job_id")),
+        "_end_time": sort_number(job.get("end_time")),
+        "_submit_time": sort_number(job.get("submit_time")),
     }
 
 
@@ -529,30 +563,116 @@ def classify_job(job):
     return "OTHER"
 
 
-def render_category(name, jobs):
-    """Render one category."""
-    spec = CATEGORIES[name]
+def sort_jobs(name, jobs):
+    """Sort a category's jobs by its sort keys (stable for ties)."""
+    keys = CATEGORIES[name]["sort"]
+    return sorted(
+        jobs, key=lambda job: tuple(job.get(key, float("inf")) for key in keys)
+    )
 
-    rows = [[job.get(key, "") for key, _header in spec["fields"]] for job in jobs]
 
-    if not rows:
+def truncate_right(text, max_width):
+    """Right-truncate text to max_width characters, keeping the start."""
+    if len(text) <= max_width:
+        return text
+
+    return text[: max_width - 1] + "…"
+
+
+def truncate_job_id(text, max_width):
+    """Shorten an array task list, keeping the job ID and closing bracket."""
+    if len(text) <= max_width:
+        return text
+
+    if text.endswith("]") and "[" in text:
+        return text[: max_width - 2] + "…]"
+
+    return truncate_right(text, max_width)
+
+
+# Columns that may be shortened, with their minimum width and how to cut them.
+# CWD is always capped at MAX_CWD_WIDTH; the others only shrink to fit a terminal.
+SHRINKABLE = {
+    "cwd": (MIN_CWD_WIDTH, truncate_left),
+    "job_id": (16, truncate_job_id),
+    "dependency": (14, truncate_right),
+    "partition": (12, truncate_right),
+}
+
+
+def format_table(name, jobs, widths=None):
+    """Format one category's table, cutting columns to the given widths."""
+    fields = CATEGORIES[name]["fields"]
+    widths = {"cwd": MAX_CWD_WIDTH, **(widths or {})}
+    rows = [
+        [
+            SHRINKABLE[key][1](job.get(key, ""), widths[key])
+            if key in widths
+            else job.get(key, "")
+            for key, _header in fields
+        ]
+        for job in jobs
+    ]
+    return tabulate.tabulate(
+        rows,
+        headers=[header for _key, header in fields],
+        tablefmt="simple",
+        disable_numparse=True,
+        colalign=tuple(
+            "right" if key in {"job_id", "cpus"} else "left" for key, _header in fields
+        ),
+    )
+
+
+def fit_table(name, jobs, max_width=None):
+    """Format a table, shrinking the widest shrinkable column first to fit."""
+    table = format_table(name, jobs)
+    if not max_width:
+        return table
+
+    overflow = max(map(len, table.splitlines())) - max_width
+    if overflow <= 0:
+        return table
+
+    keys = [key for key, _header in CATEGORIES[name]["fields"] if key in SHRINKABLE]
+    widths = {
+        key: max(
+            len(
+                SHRINKABLE[key][1](
+                    job.get(key, ""), MAX_CWD_WIDTH if key == "cwd" else 10**6
+                )
+            )
+            for job in jobs
+        )
+        for key in keys
+    }
+    while overflow > 0:
+        candidates = [key for key in keys if widths[key] > SHRINKABLE[key][0]]
+        if not candidates:
+            break
+        widest = max(candidates, key=lambda key: widths[key])
+        widths[widest] -= 1
+        overflow -= 1
+
+    return format_table(name, jobs, widths)
+
+
+def terminal_width():
+    """Terminal width when stdout is a terminal; None for pipes and files."""
+    if not sys.stdout.isatty():
+        return None
+    return shutil.get_terminal_size().columns
+
+
+def render_category(name, jobs, max_width=None):
+    """Render one category with a job count, sorted and fitted to max_width."""
+    if not jobs:
         return
 
-    click.echo(click.style(f"\n>>> {name}", fg=spec["color"], bold=True))
+    spec = CATEGORIES[name]
+    click.echo(click.style(f"\n>>> {name} ({len(jobs)})", fg=spec["color"], bold=True))
     click.echo()
-
-    click.echo(
-        tabulate.tabulate(
-            rows,
-            headers=[header for _key, header in spec["fields"]],
-            tablefmt="simple",
-            disable_numparse=True,
-            colalign=tuple(
-                "right" if key in {"job_id", "cpus"} else "left"
-                for key, _header in spec["fields"]
-            ),
-        )
-    )
+    click.echo(fit_table(name, sort_jobs(name, jobs), max_width))
 
 
 @click.command()
@@ -590,8 +710,9 @@ def main(show_all, username, host):
     for job in jobs:
         grouped[classify_job(job)].append(job)
 
+    width = terminal_width()
     for category in CATEGORIES:
-        render_category(category, grouped[category])
+        render_category(category, grouped[category], width)
 
 
 if __name__ == "__main__":

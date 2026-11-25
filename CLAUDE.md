@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+- Lint/format: `pixi run lint` (ruff check plus format check), `pixi run format` to apply
 - Tests: `pixi run test`, or `python -m unittest discover -s tests -v` in any environment with the package installed (`pip install -e .`)
 - Single test: `python -m unittest tests.test_sjobs.JobTests.test_state_flags_override_base_state -v`
 - CLI: `sjobs`, `sjobs --all`, `sjobs --user NAME`, `sjobs -H HOST`, `python -m sjobs`
@@ -32,7 +33,8 @@ All logic lives in `sjobs/sjobs.py`. `__init__.py` re-exports `main` (the `sjobs
    - GPUs (`format_gpu_requests`): use the allocation in `tres_alloc_str` when present, else the scoped `tres_per_{job,node,socket,task}` requests, else `tres_req_str`.
 5. **Render**:
    - `classify_job` buckets jobs by `primary_state`. Flags in `STATE_FLAGS` override the base state, as squeue does.
-   - `render_category` prints each non-empty category from the column and colour spec in `CATEGORIES`.
+   - `render_category` prints each non-empty category with its count, using the column, colour and sort spec in `CATEGORIES`. `sort_jobs` sorts by the `_`-prefixed raw keys from `normalize_job` (unset values last).
+   - `normalize_job` keeps the full prefix-stripped CWD. `fit_table` truncates it from the left at `MAX_CWD_WIDTH`, and shrinks it toward `MIN_CWD_WIDTH` when `terminal_width()` reports a terminal (stdout is a TTY) that is too narrow.
    - To add a column, add a key in `normalize_job` and reference it in `CATEGORIES`.
 
 Each run makes exactly one `squeue` call, to keep load on shared Slurm controllers low. A CLI test asserts this.
@@ -46,7 +48,7 @@ Each run makes exactly one `squeue` call, to keep load on shared Slurm controlle
 
 ## CI
 
-- `.github/workflows/test.yml` runs on pull requests and is reused by the deploy workflow. It runs the tests on the oldest and newest supported Python, then checks `sjobs --help` and `python -m sjobs --help`.
-- `.github/workflows/deploy.yml` runs on every push to `main` or `dev`: test, then build.
-  - On `dev` it only does a dry run.
-  - On `main` it pushes the artifacts to the `mvondomaros-lab/mvondomaros-lab.github.io` pages repo and opens a PR there.
+- `.github/workflows/test.yml` runs on pull requests and is reused by the deploy workflow. A lint job runs `pixi run lint`; the test job runs the tests on the oldest and newest supported Python, then checks `sjobs --help` and `python -m sjobs --help`.
+- `.github/workflows/deploy.yml` runs on pushes to `main` or `dev` and on `v*` tags: test, then build.
+  - Branch pushes only do a dry run.
+  - A `v*` tag must match `version` in `pyproject.toml`. It pushes the artifacts to the `mvondomaros-lab/mvondomaros-lab.github.io` pages repo and opens a PR there.

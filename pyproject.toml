@@ -40,9 +40,12 @@ preview = ["pixi-build"]
 
 [tool.pixi.dependencies]
 hatch = ">=1,<2"
+ruff = ">=0.17.6,<0.18"
 
 [tool.pixi.tasks]
 test = "python -m unittest discover -s tests -v"
+lint = "ruff check . && ruff format --check ."
+format = "ruff check --fix . && ruff format ."
 
 [tool.pixi.pypi-dependencies]
 sjobs = { path = ".", editable = true }
