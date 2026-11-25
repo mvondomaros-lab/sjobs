@@ -1,0 +1,47 @@
+name: Test
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Pixi
+        uses: prefix-dev/setup-pixi@v0.9.4
+
+      - name: Lint and format check
+        run: pixi run lint
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: python -m pip install .
+
+      - name: Test offline
+        run: python -m unittest discover -s tests -v
+
+      - name: Check entry points
+        run: |
+          sjobs --help
+          python -m sjobs --help

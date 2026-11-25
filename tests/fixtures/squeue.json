@@ -1,0 +1,59 @@
+{
+  "meta": {
+    "slurm": {
+      "release": "23.11.11"
+    }
+  },
+  "errors": [],
+  "warnings": [],
+  "jobs": [
+    {
+      "job_id": 1001,
+      "array_job_id": {"set": true, "infinite": false, "number": 1000},
+      "array_task_id": {"set": true, "infinite": false, "number": 0},
+      "array_task_string": "",
+      "current_working_directory": "/scratch_shared/demo/run 01",
+      "cpus": {"set": true, "infinite": false, "number": 16},
+      "tres_per_job": "",
+      "tres_per_node": "gres/gpu:1",
+      "tres_per_task": "cpu:16",
+      "tres_req_str": "cpu=16,mem=16G,node=1,billing=20,gres/gpu=1",
+      "tres_alloc_str": "cpu=16,mem=16G,node=1,billing=20,gres/gpu=1,gres/gpu:a100_80gb=1",
+      "job_state": ["RUNNING"],
+      "nodes": "gpu01",
+      "end_time": {"set": true, "infinite": false, "number": 1794503619}
+    },
+    {
+      "job_id": 1100,
+      "array_job_id": {"set": true, "infinite": false, "number": 1100},
+      "array_task_id": {"set": false, "infinite": false, "number": 0},
+      "array_task_string": "1-4",
+      "current_working_directory": "/scratch_shared/demo/pending",
+      "cpus": {"set": true, "infinite": false, "number": 2},
+      "tres_per_job": "",
+      "tres_per_node": "",
+      "tres_per_task": "cpu:2",
+      "job_state": ["PENDING"],
+      "partition": "batch",
+      "submit_time": {"set": true, "infinite": false, "number": 1794328380},
+      "state_reason": "Dependency",
+      "dependency": "afterok:1000_*"
+    },
+    {
+      "job_id": 1200,
+      "current_working_directory": "/scratch_shared/001234",
+      "cpus": 2,
+      "job_state": "PENDING",
+      "partition": "batch",
+      "state_reason": "Priority"
+    },
+    {
+      "job_id": 1300,
+      "current_working_directory": "/scratch_shared/demo/finishing",
+      "cpus": {"set": true, "infinite": false, "number": 4},
+      "job_state": ["RUNNING", "COMPLETING"],
+      "partition": "batch",
+      "state_reason": "None"
+    }
+  ]
+}
