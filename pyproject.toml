@@ -1,6 +1,6 @@
 [project]
 name = "sjobs"
-version = "0.6"
+version = "0.7"
 authors = [
     { name = "Michael von Domaros", email = "mvondomaros@uni-marburg.de" }
 ]
@@ -9,7 +9,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "click>=8,<9",
     "tabulate>=0.10,<0.11",
@@ -28,6 +28,7 @@ packages = ["sjobs"]
 [tool.hatch.build.targets.sdist]
 include = [
     "sjobs",
+    "tests",
     "README.md",
     "LICENSE"
 ]
@@ -39,6 +40,9 @@ preview = ["pixi-build"]
 
 [tool.pixi.dependencies]
 hatch = ">=1,<2"
+
+[tool.pixi.tasks]
+test = "python -m unittest discover -s tests -v"
 
 [tool.pixi.pypi-dependencies]
 sjobs = { path = ".", editable = true }

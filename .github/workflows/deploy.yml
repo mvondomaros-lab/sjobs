@@ -18,7 +18,11 @@ env:
   BRANCH_PREFIX: publish/sjobs
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

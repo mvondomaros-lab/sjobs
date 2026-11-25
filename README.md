@@ -3,9 +3,89 @@
 [![made-with-python](https://img.shields.io/badge/Made%20with-Python-green.svg)](https://www.python.org/)
 [![MIT license](https://img.shields.io/badge/License-MIT-green.svg)](https://lbesson.mit-license.org/)
 
-Show Slurm jobs. Public, but not intended for general use.
+Show Slurm jobs grouped into running, pending, and other states, either on a
+cluster login node or from your own machine over SSH.
 
 ## Installation
 
 See [https://mvondomaros-lab.github.io](https://mvondomaros-lab.github.io).
+
+For a local development installation with Python 3.11 or newer:
+
+```sh
+python -m pip install -e .
+```
+
+## Usage
+
+```sh
+sjobs                 # Your jobs
+sjobs --all           # All users' jobs
+sjobs --user alice    # One user's jobs (takes precedence over --all)
+sjobs -H mycluster    # Run squeue on an SSH host
+python -m sjobs       # Also available as a Python module
+```
+
+The cluster must support `squeue --json` (sjobs was developed against Slurm 23.11).
+
+## Configuration
+
+sjobs runs `squeue` over SSH on the first host it finds, in this order:
+
+1. `--host`/`-H HOST`
+2. the `SJOBS_HOST` environment variable
+3. `host` in the config file
+
+Without a host it runs `squeue` locally, and fails with a hint if `squeue` is not
+on `PATH`. The host is anything `ssh` accepts, so aliases from `~/.ssh/config`
+work. On the remote side `squeue` runs in a login shell (`sh -lc`), so `PATH` set
+in your profile applies. The default user filter applies to the account running
+`squeue`, which is your remote account when using SSH.
+
+The config file is `$XDG_CONFIG_HOME/sjobs/config.toml` (default
+`~/.config/sjobs/config.toml`). Set `SJOBS_CONFIG` to use another file.
+
+```toml
+host = "mycluster"
+# Prefixes removed from the CWD column, in addition to your local home directory.
+path_prefixes = ["/home/alice/", "/scratch/"]
+```
+
+Over SSH your local home directory usually differs from the remote one, so add the
+remote home to `path_prefixes` if you want it shortened.
+
+Each invocation makes exactly one `squeue` query and includes all job states still
+known to the controller. sjobs has no watch mode, and running it in a tight
+`watch` loop (especially with `--all`) adds needless load on the Slurm controller.
+A stuck connection or `squeue` is stopped after 60 seconds.
+
+For older completed jobs, use `sacct`. See the
+[squeue manual](https://slurm.schedmd.com/squeue.html) for details.
+
+Array tasks retain identifiers such as `1000_4` or `1000_[1-4]`. Heterogeneous
+jobs show the component as `1000+0`. Once GPUs are allocated, the GPUs column
+shows the job's total by allocated type (e.g. `1 x A100 (80GB)`), however they
+were requested (`--gpus`, `--gres=gpu:N`, …). Before allocation it shows the
+requests with their scope: per-job, per-node, per-socket, and per-task values,
+where `1 x GPU / node` means one GPU on each node and overlapping requests are
+displayed separately. Working directories have your home directory and any
+configured `path_prefixes` removed and are shortened from the left when needed.
+Timestamps use the timezone of the computer running sjobs.
+
+## Development
+
+```sh
+pixi run test
+```
+
+Or, after installing the package:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+Tests use synthetic JSON fixtures modeled on Slurm's `squeue --json` schema, with
+mocked subprocesses and an isolated config. They do not contact a cluster or
+submit jobs. Pull requests run the tests on Python 3.11 and 3.14, and the build/deploy workflow requires them to
+pass before building or publishing artifacts.
 

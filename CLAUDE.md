@@ -1,0 +1,52 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project
+
+`sjobs` is a small Click CLI that shows Slurm jobs grouped into RUNNING, PENDING and OTHER tables. It runs `squeue --json` either locally or on a configured SSH host. Runtime dependencies are only `click` and `tabulate`; see `pyproject.toml` for the supported Python range.
+
+## Commands
+
+- Tests: `pixi run test`, or `python -m unittest discover -s tests -v` in any environment with the package installed (`pip install -e .`)
+- Single test: `python -m unittest tests.test_sjobs.JobTests.test_state_flags_override_base_state -v`
+- CLI: `sjobs`, `sjobs --all`, `sjobs --user NAME`, `sjobs -H HOST`, `python -m sjobs`
+- Build, as CI does it: `pixi install && pixi build && pixi run hatch build` (conda package plus wheel/sdist)
+
+## Architecture
+
+All logic lives in `sjobs/sjobs.py`. `__init__.py` re-exports `main` (the `sjobs` console script), and `__main__.py` enables `python -m sjobs`.
+
+`main` runs a single pipeline:
+1. **Config**:
+   - `load_config` reads optional TOML from `config_path()`: `SJOBS_CONFIG`, else `$XDG_CONFIG_HOME/sjobs/config.toml`, else `~/.config/sjobs/config.toml`.
+   - `resolve_host` picks `--host`, then `SJOBS_HOST`, then `host` from config.
+   - `path_prefixes` combines the local `$HOME/` with `path_prefixes` from config.
+2. **Command**: `build_squeue_args` builds a single `squeue --json --states=all` call: `--me` by default, and `--user` takes precedence over `--all`. `build_cmdline` decides how it runs:
+   - A host is set: `ssh HOST "sh -lc '<shlex-joined squeue>'"`. User input must stay a single shell-quoted argument; a test checks for injection.
+   - No host: run `squeue` locally, or raise an error naming the three ways to set a host.
+3. **Fetch**: `run_squeue` runs the command with a timeout. Every failure becomes a `click.ClickException`, so no partial tables are printed. This covers non-zero exit, a missing executable, timeouts, bad JSON, Slurm `errors` and unexpected shapes.
+4. **Normalize**: `parse_squeue_json` validates the payload, and `normalize_job` turns each raw job into flat display strings.
+   - Slurm wraps scalars as `{set, infinite, number}`, so read values through `unwrap_slurm_value`/`format_value`.
+   - `SLURM_NO_VAL` marks unset array/het IDs.
+   - GPUs (`format_gpu_requests`): use the allocation in `tres_alloc_str` when present, else the scoped `tres_per_{job,node,socket,task}` requests, else `tres_req_str`.
+5. **Render**:
+   - `classify_job` buckets jobs by `primary_state`. Flags in `STATE_FLAGS` override the base state, as squeue does.
+   - `render_category` prints each non-empty category from the column and colour spec in `CATEGORIES`.
+   - To add a column, add a key in `normalize_job` and reference it in `CATEGORIES`.
+
+Each run makes exactly one `squeue` call, to keep load on shared Slurm controllers low. A CLI test asserts this.
+
+## Tests
+
+`tests/test_sjobs.py` runs fully offline:
+- `subprocess.run` and `shutil.which` are patched.
+- `setUpModule` points `SJOBS_CONFIG` at a missing file and clears `SJOBS_HOST`, so the developer's own config never leaks in.
+- `tests/fixtures/squeue.json` is a synthetic fixture modeled on Slurm's `squeue --json` schema.
+
+## CI
+
+- `.github/workflows/test.yml` runs on pull requests and is reused by the deploy workflow. It runs the tests on the oldest and newest supported Python, then checks `sjobs --help` and `python -m sjobs --help`.
+- `.github/workflows/deploy.yml` runs on every push to `main` or `dev`: test, then build.
+  - On `dev` it only does a dry run.
+  - On `main` it pushes the artifacts to the `mvondomaros-lab/mvondomaros-lab.github.io` pages repo and opens a PR there.
