@@ -1,10 +1,12 @@
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
@@ -13,10 +15,15 @@ import click
 import tabulate
 
 MAX_CWD_WIDTH = 56
+MAX_NAME_WIDTH = 32
 # CWD never shrinks below this when fitting a table to the terminal.
 MIN_CWD_WIDTH = 16
 # Stop a hung SSH connection or squeue instead of leaving it on the login node.
 SQUEUE_TIMEOUT = 60
+# Watch mode never polls the Slurm controller more often than this.
+MIN_WATCH_INTERVAL = 30
+DEFAULT_WATCH_INTERVAL = 60
+PROGRESS_WIDTH = 8
 SLURM_NO_VAL = 0xFFFFFFFE
 
 # Match squeue's display precedence when JSON includes both a base state and flags.
@@ -41,16 +48,36 @@ CONFIG_ENV_VAR = "SJOBS_CONFIG"
 # its physical path, which Slurm records for working directories) arrives with
 # the same call.
 REMOTE_HOME_MARKER = "SJOBS_HOME="
+# Starts the output of one tool in the script; squeue always comes last.
+SECTION_MARKER = "SJOBS_SECTION="
+
+SSHARE_FIELDS = (
+    "Account",
+    "User",
+    "RawShares",
+    "NormShares",
+    "RawUsage",
+    "EffectvUsage",
+    "FairShare",
+)
+# Job ID, user, partition, weighted total, then the weighted factors:
+# age, fair share, job size, partition, QOS, TRES, nice.
+SPRIO_FORMAT = "%i|%u|%r|%Y|%A|%F|%J|%P|%Q|%T|%N"
+SPRIO_FACTORS = {"age": 4, "fs": 5, "size": 6, "part": 7, "qos": 8}
 
 CATEGORIES = {
     "RUNNING": {
         "fields": [
             ("job_id", "Job ID"),
+            ("name", "Name"),
             ("cwd", "CWD"),
             ("cpus", "CPUs"),
             ("gpus", "GPUs"),
             ("nodes", "Nodes"),
-            ("end_time", "End Time"),
+            ("elapsed", "Elapsed"),
+            ("progress", "Progress"),
+            ("time_left", "Left"),
+            ("end_time", "Ends"),
         ],
         "color": "green",
         # Soonest to finish first.
@@ -59,21 +86,26 @@ CATEGORIES = {
     "PENDING": {
         "fields": [
             ("job_id", "Job ID"),
+            ("name", "Name"),
             ("cwd", "CWD"),
             ("cpus", "CPUs"),
             ("gpus", "GPUs"),
             ("partition", "Partition"),
-            ("submit_time", "Submit Time"),
+            ("submitted", "Submitted"),
+            ("est_start", "Est. Start"),
+            ("priority", "Priority"),
+            ("factors", "Factors"),
             ("reason", "Reason"),
             ("dependency", "Dependency"),
         ],
         "color": "cyan",
-        # Oldest submission first.
-        "sort": ("_submit_time", "_job_id"),
+        # Highest priority first, then oldest submission.
+        "sort": ("_priority", "_submit_time", "_job_id"),
     },
     "OTHER": {
         "fields": [
             ("job_id", "Job ID"),
+            ("name", "Name"),
             ("cwd", "CWD"),
             ("cpus", "CPUs"),
             ("gpus", "GPUs"),
@@ -85,6 +117,7 @@ CATEGORIES = {
         "sort": ("_job_id",),
     },
 }
+RIGHT_ALIGNED = {"job_id", "cpus", "elapsed", "time_left", "priority"}
 
 
 def config_path():
@@ -166,35 +199,66 @@ def build_squeue_args(show_all=False, username=None):
     return args + ["--me"]
 
 
+def optional_section(name, command):
+    """Script step that prints a section marker, then a tool's output or why not.
+
+    Its stderr joins its stdout so a failure becomes a note, never an error.
+    """
+    tool = command.split()[0]
+    marker = shlex.quote(SECTION_MARKER + name)
+    return (
+        f"printf '%s\\n' {marker}; "
+        f"if command -v {tool} >/dev/null 2>&1; then {command} 2>&1; "
+        f"else printf '%s\\n' '{tool} not found'; fi"
+    )
+
+
+def build_script(show_all=False, username=None):
+    """Shell script: home markers, then sshare and sprio, then squeue.
+
+    squeue runs last, so its exit status and stderr decide success and
+    everything after its marker is its JSON.
+    """
+    user = f"-u {shlex.quote(username)}" if username else '-u "$(id -un)"'
+    sprio_user = "" if show_all and not username else f" {user}"
+    home = shlex.quote(REMOTE_HOME_MARKER)
+    return "; ".join(
+        [
+            (
+                f"printf '%s%s\\n%s%s\\n' {home} \"$HOME\" {home} "
+                '"$(cd 2>/dev/null && pwd -P)"'
+            ),
+            optional_section(
+                "sshare", f"sshare -P -n -U -o {','.join(SSHARE_FIELDS)} {user}"
+            ),
+            optional_section(
+                "sprio", f"sprio -h -o {shlex.quote(SPRIO_FORMAT)}{sprio_user}"
+            ),
+            f"printf '%s\\n' {shlex.quote(SECTION_MARKER + 'squeue')}",
+            shlex.join(build_squeue_args(show_all=show_all, username=username)),
+        ]
+    )
+
+
 def build_cmdline(show_all=False, username=None, host=None):
-    """Build squeue command: SSH to host if one is set, else run locally."""
-    args = build_squeue_args(show_all=show_all, username=username)
+    """Build the command: the script over SSH if a host is set, else locally."""
+    script = build_script(show_all=show_all, username=username)
 
     if not host:
         if shutil.which("squeue"):
-            return args
+            return ["sh", "-c", script]
         raise click.ClickException(
             "squeue is not on PATH and no cluster host is configured. "
             f"Use --host, set {HOST_ENV_VAR}, or set 'host' in {config_path()}."
         )
 
-    # One SSH call: report the remote home, then run squeue (its exit status wins).
-    marker = shlex.quote(REMOTE_HOME_MARKER)
-    remote_command = (
-        f"printf '%s%s\\n%s%s\\n' {marker} \"$HOME\" {marker} "
-        '"$(cd 2>/dev/null && pwd -P)" && ' + shlex.join(args)
-    )
-
-    return [
-        "ssh",
-        host,
-        shlex.join(["sh", "-lc", remote_command]),
-    ]
+    return ["ssh", host, shlex.join(["sh", "-lc", script])]
 
 
 def run_squeue(show_all=False, username=None, host=None):
-    """Run squeue and return stdout."""
+    """Run the script and return stdout."""
     cmdline = build_cmdline(show_all=show_all, username=username, host=host)
+    description = f"squeue on {host}" if host else "squeue"
 
     try:
         result = subprocess.run(
@@ -206,19 +270,19 @@ def run_squeue(show_all=False, username=None, host=None):
         )
     except subprocess.TimeoutExpired as exc:
         raise click.ClickException(
-            f"`{shlex.join(cmdline)}` did not finish within {SQUEUE_TIMEOUT} s"
+            f"`{description}` did not finish within {SQUEUE_TIMEOUT} s"
         ) from exc
     except subprocess.CalledProcessError as exc:
         details = (
-            (exc.stderr or "").strip() or (exc.stdout or "").strip() or "unknown error"
+            (exc.stderr or "").strip()
+            or split_sections(exc.stdout or "")[2].strip()
+            or "unknown error"
         )
         raise click.ClickException(
-            f"Failed to fetch jobs with `{shlex.join(cmdline)}`: {details}"
+            f"Failed to fetch jobs with `{description}`: {details}"
         ) from exc
     except OSError as exc:
-        raise click.ClickException(
-            f"Failed to run `{shlex.join(cmdline)}`: {exc}"
-        ) from exc
+        raise click.ClickException(f"Failed to run `{cmdline[0]}`: {exc}") from exc
 
     return result.stdout
 
@@ -494,60 +558,284 @@ def sort_number(value):
     return float("inf")
 
 
-def normalize_job(job, prefixes=None):
+def epoch(value):
+    """Return a set Slurm timestamp in seconds, or None."""
+    value = unwrap_slurm_value(value)
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 < value < SLURM_NO_VAL
+    ):
+        return value
+    return None
+
+
+def time_limit_seconds(value):
+    """Slurm time limit (minutes) in seconds; math.inf if unlimited, None if unset."""
+    value = unwrap_slurm_value(value)
+    if value == "infinite":
+        return math.inf
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 < value < SLURM_NO_VAL
+    ):
+        return value * 60
+    return None
+
+
+def format_duration(seconds):
+    """Compact duration: 45m, 3h12m, 1d04h."""
+    if seconds is None:
+        return ""
+    if seconds == math.inf:
+        return "unlimited"
+    minutes = int(max(seconds, 0) // 60)
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    if days:
+        return f"{days}d{hours:02d}h"
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m"
+
+
+def format_age(timestamp, now):
+    """How long ago a timestamp was, e.g. `2h05m ago`."""
+    if timestamp is None or timestamp > now:
+        return ""
+    return f"{format_duration(now - timestamp)} ago"
+
+
+def format_when(timestamp, now):
+    """Timestamp relative to today: `today 18:05`, `Thu 09:12`, else the date."""
+    if timestamp is None:
+        return ""
+    try:
+        when = datetime.fromtimestamp(timestamp)
+        today = datetime.fromtimestamp(now).date()
+    except (OverflowError, OSError, ValueError):
+        return format_value(timestamp)
+    days = (when.date() - today).days
+    if days == 0:
+        return f"today {when:%H:%M}"
+    if days == 1:
+        return f"tomorrow {when:%H:%M}"
+    if days == -1:
+        return f"yesterday {when:%H:%M}"
+    if abs(days) < 7:
+        return f"{when:%a %H:%M}"
+    return f"{when:%Y-%m-%d %H:%M}"
+
+
+def progress_bar(fraction, width=PROGRESS_WIDTH):
+    """Bar plus percentage, e.g. `██░░░░░░  25%`."""
+    fraction = min(max(fraction, 0.0), 1.0)
+    filled = round(fraction * width)
+    return f"{'█' * filled}{'░' * (width - filled)} {round(fraction * 100):3d}%"
+
+
+def gpu_count(tres_str):
+    """Number of GPUs in a TRES count string such as tres_alloc_str."""
+    generic = 0
+    typed = 0
+    for item in format_value(tres_str).split(","):
+        name, sep, count = item.strip().partition("=")
+        if not sep or not count.isdigit():
+            continue
+        if name == "gres/gpu":
+            generic = int(count)
+        elif name.startswith("gres/gpu:"):
+            typed += int(count)
+    return generic or typed
+
+
+def first_line(text):
+    """First non-blank line of text, shortened for a note; None if blank."""
+    for line in (text or "").splitlines():
+        if line.strip():
+            return truncate_right(line.strip(), 80)
+    return None
+
+
+def parse_sshare(text):
+    """Parse `sshare -P -n -U` rows into (rows, problem).
+
+    `problem` is a short reason when the text held output but no rows.
+    """
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != len(SSHARE_FIELDS) or not parts[1]:
+            continue
+        try:
+            norm_shares, usage, fairshare = (float(parts[i]) for i in (3, 5, 6))
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "account": parts[0],
+                "user": parts[1],
+                "norm_shares": norm_shares,
+                "usage": usage,
+                "fairshare": fairshare,
+            }
+        )
+    return rows, None if rows else first_line(text)
+
+
+def parse_sprio(text):
+    """Parse `sprio -h -o SPRIO_FORMAT` rows into ({job_id: entry}, problem).
+
+    A job pending in several partitions keeps its highest-priority row.
+    """
+    priorities = {}
+    for line in (text or "").splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) != SPRIO_FORMAT.count("|") + 1:
+            continue
+        job_id = re.match(r"\d+", parts[0])
+        if not job_id:
+            continue
+        try:
+            priority = float(parts[3])
+            factors = {
+                name: float(parts[index] or 0) for name, index in SPRIO_FACTORS.items()
+            }
+        except ValueError:
+            continue
+        factors["tres"] = sum(map(float, re.findall(r"=([\d.]+)", parts[9])))
+        job_id = int(job_id.group())
+        if job_id not in priorities or priority > priorities[job_id]["priority"]:
+            priorities[job_id] = {"priority": priority, "factors": factors}
+    return priorities, None if priorities else first_line(text)
+
+
+def format_factors(factors):
+    """Each priority factor's share of the total, largest first: `age 75% fs 20%`."""
+    total = sum(value for value in factors.values() if value > 0)
+    if total <= 0:
+        return ""
+    shares = sorted(
+        (-round(100 * value / total), name) for name, value in factors.items()
+    )
+    return " ".join(f"{name} {-share}%" for share, name in shares if share <= -1)
+
+
+def normalize_job(job, prefixes=None, now=None, priorities=None):
     """Normalize one squeue JSON job into display fields.
 
     `cwd` keeps the full prefix-stripped path; rendering truncates it to fit.
-    Keys starting with an underscore are sort keys, not display fields.
+    `priorities` maps job IDs to parsed sprio entries.
+    Keys starting with an underscore are sort keys and totals, not display fields.
     """
+    now = time.time() if now is None else now
+    start = epoch(job.get("start_time"))
+    end = epoch(job.get("end_time"))
+    submit = epoch(job.get("submit_time"))
+    limit = time_limit_seconds(job.get("time_limit"))
+    elapsed = now - start if start is not None and start <= now else None
+
+    if end is not None:
+        left = max(end - now, 0)
+    elif limit is not None and elapsed is not None:
+        left = max(limit - elapsed, 0)
+    else:
+        left = None
+
+    progress = ""
+    if elapsed is not None and limit not in (None, math.inf):
+        progress = progress_bar(elapsed / limit)
+
+    raw_id = unwrap_slurm_value(job.get("job_id"))
+    sprio = (priorities or {}).get(raw_id)
+    if sprio:
+        priority = sprio["priority"]
+    else:
+        priority = unwrap_slurm_value(job.get("priority"))
+        if not isinstance(priority, (int, float)) or isinstance(priority, bool):
+            priority = None
+    cpus = unwrap_slurm_value(job.get("cpus"))
+
     return {
         "job_id": format_job_id(job),
+        "name": format_value(job.get("name")),
+        "user": format_value(job.get("user_name")),
         "cwd": strip_prefix(job.get("current_working_directory"), prefixes),
         "cpus": format_value(job.get("cpus")),
         "gpus": format_gpu_requests(job),
         "state": primary_state(job),
         "nodes": format_value(job.get("nodes")),
-        "end_time": format_timestamp(job.get("end_time")),
+        "elapsed": format_duration(elapsed),
+        "progress": progress,
+        "time_left": format_duration(math.inf if limit == math.inf else left),
+        "end_time": format_when(end, now),
         "partition": format_value(job.get("partition")),
-        "submit_time": format_timestamp(job.get("submit_time")),
+        "submitted": format_age(submit, now),
+        "est_start": format_when(start, now) if start and start > now else "",
+        "priority": "" if priority is None else str(int(priority)),
+        "factors": format_factors(sprio["factors"]) if sprio else "",
         "reason": format_value(job.get("state_reason")),
         "dependency": format_value(job.get("dependency")),
         "_job_id": sort_number(job.get("job_id")),
         "_end_time": sort_number(job.get("end_time")),
         "_submit_time": sort_number(job.get("submit_time")),
+        "_priority": -priority if priority is not None else float("inf"),
+        "_cpus": cpus if isinstance(cpus, int) and not isinstance(cpus, bool) else 0,
+        "_gpus": gpu_count(job.get("tres_alloc_str")),
     }
 
 
-def split_remote_output(stdout):
-    """Split SSH output into (remote home directories, squeue JSON).
+def split_sections(stdout):
+    """Split the script output into (home directories, {section: text}, JSON).
 
-    Anything a login profile prints before the marker lines is dropped. Without
-    markers, the homes are unknown and the whole output is treated as JSON.
+    Anything a login profile prints before the first marker is dropped.
+    Everything after the squeue marker is its JSON. Without markers, the homes
+    are unknown and the whole output is treated as JSON.
     """
     lines = stdout.splitlines(keepends=True)
     homes = []
+    sections = {}
+    current = None
     last = None
     for index, line in enumerate(lines):
         if line.startswith(REMOTE_HOME_MARKER):
             home = line.removeprefix(REMOTE_HOME_MARKER).rstrip("\r\n")
             if home and home not in homes:
                 homes.append(home)
-            last = index
+            current, last = None, index
+        elif line.startswith(SECTION_MARKER):
+            name = line.removeprefix(SECTION_MARKER).strip()
+            if name == "squeue":
+                return homes, sections, "".join(lines[index + 1 :])
+            current, last = name, index
+            sections[current] = ""
+        elif current is not None:
+            sections[current] += line
     if last is None:
-        return [], stdout
-    return homes, "".join(lines[last + 1 :])
+        return [], {}, stdout
+    return homes, sections, "".join(lines[last + 1 :]) if current is None else ""
 
 
-def fetch_jobs(show_all=False, username=None, host=None, config=None):
-    """Fetch and normalize all jobs."""
+def fetch_snapshot(show_all=False, username=None, host=None, config=None, now=None):
+    """Fetch and normalize all jobs plus fair share and priority data.
+
+    Returns a dict with `jobs`, `shares` and per-tool `problems`.
+    """
+    now = time.time() if now is None else now
     stdout = run_squeue(show_all=show_all, username=username, host=host)
-    if host:
-        homes, stdout = split_remote_output(stdout)
-    else:
+    homes, sections, stdout = split_sections(stdout)
+    if not homes and not host:
         homes = local_homes()
     jobs = parse_squeue_json(stdout)
+    priorities, sprio_problem = parse_sprio(sections.get("sprio"))
+    shares, sshare_problem = parse_sshare(sections.get("sshare"))
     prefixes = path_prefixes(config, homes)
-    return [normalize_job(job, prefixes) for job in jobs]
+    return {
+        "jobs": [normalize_job(job, prefixes, now, priorities) for job in jobs],
+        "shares": shares,
+        "problems": {"sshare": sshare_problem, "sprio": sprio_problem},
+    }
 
 
 def classify_job(job):
@@ -591,19 +879,33 @@ def truncate_job_id(text, max_width):
 
 
 # Columns that may be shortened, with their minimum width and how to cut them.
-# CWD is always capped at MAX_CWD_WIDTH; the others only shrink to fit a terminal.
+# CWD and Name are always capped (CAPPED); the others only shrink to fit a terminal.
+CAPPED = {"cwd": MAX_CWD_WIDTH, "name": MAX_NAME_WIDTH}
 SHRINKABLE = {
     "cwd": (MIN_CWD_WIDTH, truncate_left),
     "job_id": (16, truncate_job_id),
+    "name": (10, truncate_right),
+    "user": (8, truncate_right),
+    "nodes": (10, truncate_right),
+    "factors": (10, truncate_right),
     "dependency": (14, truncate_right),
     "partition": (12, truncate_right),
 }
 
 
-def format_table(name, jobs, widths=None):
+def category_fields(name, show_user=False):
+    """A category's columns, with a User column after Name when requested."""
+    fields = list(CATEGORIES[name]["fields"])
+    if show_user:
+        index = next(i for i, (key, _header) in enumerate(fields) if key == "name")
+        fields.insert(index + 1, ("user", "User"))
+    return fields
+
+
+def format_table(name, jobs, widths=None, show_user=False):
     """Format one category's table, cutting columns to the given widths."""
-    fields = CATEGORIES[name]["fields"]
-    widths = {"cwd": MAX_CWD_WIDTH, **(widths or {})}
+    fields = category_fields(name, show_user)
+    widths = {**CAPPED, **(widths or {})}
     rows = [
         [
             SHRINKABLE[key][1](job.get(key, ""), widths[key])
@@ -619,14 +921,14 @@ def format_table(name, jobs, widths=None):
         tablefmt="simple",
         disable_numparse=True,
         colalign=tuple(
-            "right" if key in {"job_id", "cpus"} else "left" for key, _header in fields
+            "right" if key in RIGHT_ALIGNED else "left" for key, _header in fields
         ),
     )
 
 
-def fit_table(name, jobs, max_width=None):
+def fit_table(name, jobs, max_width=None, show_user=False):
     """Format a table, shrinking the widest shrinkable column first to fit."""
-    table = format_table(name, jobs)
+    table = format_table(name, jobs, show_user=show_user)
     if not max_width:
         return table
 
@@ -634,14 +936,12 @@ def fit_table(name, jobs, max_width=None):
     if overflow <= 0:
         return table
 
-    keys = [key for key, _header in CATEGORIES[name]["fields"] if key in SHRINKABLE]
+    keys = [
+        key for key, _header in category_fields(name, show_user) if key in SHRINKABLE
+    ]
     widths = {
         key: max(
-            len(
-                SHRINKABLE[key][1](
-                    job.get(key, ""), MAX_CWD_WIDTH if key == "cwd" else 10**6
-                )
-            )
+            len(SHRINKABLE[key][1](job.get(key, ""), CAPPED.get(key, 10**6)))
             for job in jobs
         )
         for key in keys
@@ -654,7 +954,7 @@ def fit_table(name, jobs, max_width=None):
         widths[widest] -= 1
         overflow -= 1
 
-    return format_table(name, jobs, widths)
+    return format_table(name, jobs, widths, show_user=show_user)
 
 
 def terminal_width():
@@ -664,15 +964,109 @@ def terminal_width():
     return shutil.get_terminal_size().columns
 
 
-def render_category(name, jobs, max_width=None):
-    """Render one category with a job count, sorted and fitted to max_width."""
+def render_category(name, jobs, max_width=None, show_user=False):
+    """One category with a job count, sorted and fitted to max_width; "" if empty."""
     if not jobs:
-        return
+        return ""
 
     spec = CATEGORIES[name]
-    click.echo(click.style(f"\n>>> {name} ({len(jobs)})", fg=spec["color"], bold=True))
-    click.echo()
-    click.echo(fit_table(name, sort_jobs(name, jobs), max_width))
+    header = click.style(f">>> {name} ({len(jobs)})", fg=spec["color"], bold=True)
+    table = fit_table(name, sort_jobs(name, jobs), max_width, show_user)
+    return f"\n{header}\n\n{table}"
+
+
+def fairshare_color(value):
+    """Green when well placed, yellow when middling, red when low."""
+    if value >= 0.5:
+        return "green"
+    if value >= 0.2:
+        return "yellow"
+    return "red"
+
+
+def plural(count, noun):
+    """`1 GPU`, `2 GPUs`."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def render_title(host, now):
+    """`sjobs · HOST · Wed 14:32`."""
+    when = datetime.fromtimestamp(now).strftime("%a %H:%M")
+    return f"{click.style('sjobs', bold=True)} · {host or 'local'} · {when}"
+
+
+def render_summary(grouped, snapshot, host, now, show_user=False):
+    """Title and job counts, fair share lines, and notes about missing data."""
+    running = grouped["RUNNING"]
+    counts = []
+    if running:
+        totals = [plural(sum(job["_cpus"] for job in running), "CPU")]
+        gpus = sum(job["_gpus"] for job in running)
+        if gpus:
+            totals.append(plural(gpus, "GPU"))
+        counts.append(f"{len(running)} running ({', '.join(totals)})")
+    if grouped["PENDING"]:
+        counts.append(f"{len(grouped['PENDING'])} pending")
+    if grouped["OTHER"]:
+        counts.append(f"{len(grouped['OTHER'])} other")
+    lines = [f"{render_title(host, now)}   {' · '.join(counts) or 'no jobs'}"]
+
+    shares = snapshot["shares"]
+    labels = [
+        f"{row['user']}@{row['account']}" if show_user else row["account"]
+        for row in shares
+    ]
+    width = max(map(len, labels), default=0)
+    for label, row in zip(labels, shares):
+        value = click.style(
+            f"{row['fairshare']:.3f}", fg=fairshare_color(row["fairshare"]), bold=True
+        )
+        lines.append(
+            f"Fair share  {label.ljust(width)}  {value}  "
+            f"(usage {row['usage']:.1%} vs. {row['norm_shares']:.1%} share)"
+        )
+
+    problems = snapshot["problems"]
+    notes = []
+    if problems.get("sshare"):
+        notes.append(f"fair share unavailable: {problems['sshare']}")
+    # sprio reports an error when there is nothing pending; only then is it news.
+    if problems.get("sprio") and grouped["PENDING"]:
+        notes.append(f"priority factors unavailable: {problems['sprio']}")
+    lines.extend(click.style(note, dim=True) for note in notes)
+    return "\n".join(lines)
+
+
+def render_frame(snapshot, host=None, now=None, max_width=None, show_user=False):
+    """The whole output: summary, then each non-empty category."""
+    now = time.time() if now is None else now
+    grouped = {category: [] for category in CATEGORIES}
+    for job in snapshot["jobs"]:
+        grouped[classify_job(job)].append(job)
+
+    parts = [render_summary(grouped, snapshot, host, now, show_user)]
+    for category in CATEGORIES:
+        parts.append(render_category(category, grouped[category], max_width, show_user))
+    return "\n".join(part for part in parts if part)
+
+
+def run_watch(make_frame, interval, host=None):
+    """Redraw every interval seconds until Ctrl-C; errors are shown, not fatal."""
+    footer = click.style(f"refreshing every {interval} s · Ctrl-C to quit", dim=True)
+    try:
+        while True:
+            try:
+                text = make_frame()
+            except click.ClickException as exc:
+                text = f"{render_title(host, time.time())}\n\n" + click.style(
+                    f"Error: {exc.format_message()}", fg="red"
+                )
+            if sys.stdout.isatty():
+                click.clear()
+            click.echo(f"{text}\n\n{footer}")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        click.echo()
 
 
 @click.command()
@@ -696,23 +1090,42 @@ def render_category(name, jobs, max_width=None):
     metavar="HOST",
     help=f"SSH host to run squeue on (overrides {HOST_ENV_VAR} and the config file).",
 )
-def main(show_all, username, host):
-    """Show Slurm jobs."""
+@click.option(
+    "--watch",
+    "-w",
+    is_flag=True,
+    help="Redraw the output every --interval seconds until Ctrl-C.",
+)
+@click.option(
+    "--interval",
+    type=click.IntRange(min=MIN_WATCH_INTERVAL),
+    default=DEFAULT_WATCH_INTERVAL,
+    show_default=True,
+    metavar="SECONDS",
+    help=f"Seconds between refreshes in watch mode (at least {MIN_WATCH_INTERVAL}, "
+    "to keep load on the Slurm controller low).",
+)
+def main(show_all, username, host, watch, interval):
+    """Show Slurm jobs, your fair share, and pending job priorities."""
     config = load_config()
-    grouped = {category: [] for category in CATEGORIES}
+    host = resolve_host(host, config)
+    show_user = bool(show_all or username)
 
-    jobs = fetch_jobs(
-        show_all=show_all,
-        username=username,
-        host=resolve_host(host, config),
-        config=config,
-    )
-    for job in jobs:
-        grouped[classify_job(job)].append(job)
+    def make_frame():
+        now = time.time()
+        snapshot = fetch_snapshot(
+            show_all=show_all,
+            username=username,
+            host=host,
+            config=config,
+            now=now,
+        )
+        return render_frame(snapshot, host, now, terminal_width(), show_user)
 
-    width = terminal_width()
-    for category in CATEGORIES:
-        render_category(category, grouped[category], width)
+    if watch:
+        run_watch(make_frame, interval, host)
+    else:
+        click.echo(make_frame())
 
 
 if __name__ == "__main__":

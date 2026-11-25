@@ -21,7 +21,11 @@
       "tres_alloc_str": "cpu=16,mem=16G,node=1,billing=20,gres/gpu=1,gres/gpu:a100_80gb=1",
       "job_state": ["RUNNING"],
       "nodes": "gpu01",
-      "end_time": {"set": true, "infinite": false, "number": 1794503619}
+      "end_time": {"set": true, "infinite": false, "number": 1794503619},
+      "start_time": {"set": true, "infinite": false, "number": 1794460419},
+      "time_limit": {"set": true, "infinite": false, "number": 720},
+      "name": "md run",
+      "user_name": "alice"
     },
     {
       "job_id": 1100,
@@ -37,7 +41,9 @@
       "partition": "batch",
       "submit_time": {"set": true, "infinite": false, "number": 1794328380},
       "state_reason": "Dependency",
-      "dependency": "afterok:1000_*"
+      "dependency": "afterok:1000_*",
+      "name": "pending-array",
+      "user_name": "alice"
     },
     {
       "job_id": 1200,
@@ -45,7 +51,12 @@
       "cpus": 2,
       "job_state": "PENDING",
       "partition": "batch",
-      "state_reason": "Priority"
+      "state_reason": "Priority",
+      "submit_time": {"set": true, "infinite": false, "number": 1794475000},
+      "start_time": {"set": true, "infinite": false, "number": 1794485619},
+      "priority": {"set": true, "infinite": false, "number": 4000},
+      "name": "queued",
+      "user_name": "alice"
     },
     {
       "job_id": 1300,
