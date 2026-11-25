@@ -21,9 +21,9 @@ All logic lives in `sjobs/sjobs.py`. `__init__.py` re-exports `main` (the `sjobs
 1. **Config**:
    - `load_config` reads optional TOML from `config_path()`: `SJOBS_CONFIG`, else `$XDG_CONFIG_HOME/sjobs/config.toml`, else `~/.config/sjobs/config.toml`.
    - `resolve_host` picks `--host`, then `SJOBS_HOST`, then `host` from config.
-   - `path_prefixes` combines the local `$HOME/` with `path_prefixes` from config.
+   - `path_prefixes` combines the home directory where `squeue` runs with `path_prefixes` from config.
 2. **Command**: `build_squeue_args` builds a single `squeue --json --states=all` call: `--me` by default, and `--user` takes precedence over `--all`. `build_cmdline` decides how it runs:
-   - A host is set: `ssh HOST "sh -lc '<shlex-joined squeue>'"`. User input must stay a single shell-quoted argument; a test checks for injection.
+   - A host is set: `ssh HOST "sh -lc '<script>'"`. The script prints `SJOBS_HOME=` marker lines for `$HOME` and its physical path (Slurm records physical working directories), then runs `squeue`. `split_remote_output` drops any login-profile noise before the markers and returns the remote homes. User input must stay a single shell-quoted argument; one test checks for injection, and another runs the script in a real `sh` with a fake `squeue`.
    - No host: run `squeue` locally, or raise an error naming the three ways to set a host.
 3. **Fetch**: `run_squeue` runs the command with a timeout. Every failure becomes a `click.ClickException`, so no partial tables are printed. This covers non-zero exit, a missing executable, timeouts, bad JSON, Slurm `errors` and unexpected shapes.
 4. **Normalize**: `parse_squeue_json` validates the payload, and `normalize_job` turns each raw job into flat display strings.

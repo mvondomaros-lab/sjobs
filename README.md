@@ -23,6 +23,7 @@ sjobs                 # Your jobs
 sjobs --all           # All users' jobs
 sjobs --user alice    # One user's jobs (takes precedence over --all)
 sjobs -H mycluster    # Run squeue on an SSH host
+sjobs --version       # Show the installed version
 python -m sjobs       # Also available as a Python module
 ```
 
@@ -39,7 +40,9 @@ sjobs runs `squeue` over SSH on the first host it finds, in this order:
 Without a host it runs `squeue` locally, and fails with a hint if `squeue` is not
 on `PATH`. The host is anything `ssh` accepts, so aliases from `~/.ssh/config`
 work. On the remote side `squeue` runs in a login shell (`sh -lc`), so `PATH` set
-in your profile applies. The default user filter applies to the account running
+in your profile applies. The same call first prints the remote home directory
+(both `$HOME` and its physical path, since Slurm records physical paths), so it is
+shortened in the CWD column without extra configuration. The default user filter applies to the account running
 `squeue`, which is your remote account when using SSH.
 
 The config file is `$XDG_CONFIG_HOME/sjobs/config.toml` (default
@@ -47,12 +50,10 @@ The config file is `$XDG_CONFIG_HOME/sjobs/config.toml` (default
 
 ```toml
 host = "mycluster"
-# Prefixes removed from the CWD column, in addition to your local home directory.
-path_prefixes = ["/home/alice/", "/scratch/"]
+# Prefixes removed from the CWD column, in addition to your home directory
+# (local, or remote when using SSH).
+path_prefixes = ["/scratch/", "/mnt/nfs/home/"]
 ```
-
-Over SSH your local home directory usually differs from the remote one, so add the
-remote home to `path_prefixes` if you want it shortened.
 
 Each invocation makes exactly one `squeue` query and includes all job states still
 known to the controller. sjobs has no watch mode, and running it in a tight
@@ -68,8 +69,8 @@ shows the job's total by allocated type (e.g. `1 x A100 (80GB)`), however they
 were requested (`--gpus`, `--gres=gpu:N`, …). Before allocation it shows the
 requests with their scope: per-job, per-node, per-socket, and per-task values,
 where `1 x GPU / node` means one GPU on each node and overlapping requests are
-displayed separately. Working directories have your home directory and any
-configured `path_prefixes` removed and are shortened from the left when needed.
+displayed separately. Working directories have your home directory (on the
+machine running `squeue`) and any configured `path_prefixes` removed and are shortened from the left when needed.
 Timestamps use the timezone of the computer running sjobs.
 
 ## Development

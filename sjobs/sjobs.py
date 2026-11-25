@@ -34,6 +34,10 @@ STATE_FLAGS = (
 
 HOST_ENV_VAR = "SJOBS_HOST"
 CONFIG_ENV_VAR = "SJOBS_CONFIG"
+# Printed before squeue over SSH so the remote home directory (as $HOME and as
+# its physical path, which Slurm records for working directories) arrives with
+# the same call.
+REMOTE_HOME_MARKER = "SJOBS_HOME="
 
 CATEGORIES = {
     "RUNNING": {
@@ -127,11 +131,19 @@ def resolve_host(cli_host=None, config=None):
     return (config or {}).get("host")
 
 
-def path_prefixes(config=None):
-    """Prefixes stripped from working directories: local $HOME plus config."""
-    prefixes = [f"{Path.home()}/"]
-    for prefix in (config or {}).get("path_prefixes", []):
-        prefixes.append(prefix if prefix.endswith("/") else f"{prefix}/")
+def local_homes():
+    """The local home directory, as given and with symlinks resolved."""
+    home = Path.home()
+    return [str(home), str(home.resolve())]
+
+
+def path_prefixes(config=None, homes=()):
+    """Prefixes stripped from working directories: home directories plus config."""
+    prefixes = []
+    for prefix in [*homes, *(config or {}).get("path_prefixes", [])]:
+        prefix = f"{prefix.rstrip('/')}/"
+        if prefix != "/" and prefix not in prefixes:
+            prefixes.append(prefix)
     return prefixes
 
 
@@ -160,7 +172,12 @@ def build_cmdline(show_all=False, username=None, host=None):
             f"Use --host, set {HOST_ENV_VAR}, or set 'host' in {config_path()}."
         )
 
-    remote_command = shlex.join(args)
+    # One SSH call: report the remote home, then run squeue (its exit status wins).
+    marker = shlex.quote(REMOTE_HOME_MARKER)
+    remote_command = (
+        f"printf '%s%s\\n%s%s\\n' {marker} \"$HOME\" {marker} "
+        '"$(cd 2>/dev/null && pwd -P)" && ' + shlex.join(args)
+    )
 
     return [
         "ssh",
@@ -340,7 +357,7 @@ def shorten_path(path, prefixes=None, max_width=MAX_CWD_WIDTH):
     path = format_value(path)
 
     if prefixes is None:
-        prefixes = path_prefixes()
+        prefixes = path_prefixes(homes=local_homes())
 
     for prefix in sorted(prefixes, key=len, reverse=True):
         if path.startswith(prefix):
@@ -467,10 +484,35 @@ def normalize_job(job, prefixes=None):
     }
 
 
-def fetch_jobs(show_all=False, username=None, host=None, prefixes=None):
+def split_remote_output(stdout):
+    """Split SSH output into (remote home directories, squeue JSON).
+
+    Anything a login profile prints before the marker lines is dropped. Without
+    markers, the homes are unknown and the whole output is treated as JSON.
+    """
+    lines = stdout.splitlines(keepends=True)
+    homes = []
+    last = None
+    for index, line in enumerate(lines):
+        if line.startswith(REMOTE_HOME_MARKER):
+            home = line.removeprefix(REMOTE_HOME_MARKER).rstrip("\r\n")
+            if home and home not in homes:
+                homes.append(home)
+            last = index
+    if last is None:
+        return [], stdout
+    return homes, "".join(lines[last + 1 :])
+
+
+def fetch_jobs(show_all=False, username=None, host=None, config=None):
     """Fetch and normalize all jobs."""
     stdout = run_squeue(show_all=show_all, username=username, host=host)
+    if host:
+        homes, stdout = split_remote_output(stdout)
+    else:
+        homes = local_homes()
     jobs = parse_squeue_json(stdout)
+    prefixes = path_prefixes(config, homes)
     return [normalize_job(job, prefixes) for job in jobs]
 
 
@@ -514,6 +556,7 @@ def render_category(name, jobs):
 
 
 @click.command()
+@click.version_option(package_name="sjobs")
 @click.option(
     "--all",
     "show_all",
@@ -542,7 +585,7 @@ def main(show_all, username, host):
         show_all=show_all,
         username=username,
         host=resolve_host(host, config),
-        prefixes=path_prefixes(config),
+        config=config,
     )
     for job in jobs:
         grouped[classify_job(job)].append(job)

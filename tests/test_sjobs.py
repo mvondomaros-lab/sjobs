@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from datetime import datetime
+from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
 
@@ -80,10 +81,44 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(command[:2], ["ssh", "cluster"])
         shell = shlex.split(command[2])
         self.assertEqual(shell[:2], ["sh", "-lc"])
+        script = shlex.split(shell[2])
         self.assertEqual(
-            shlex.split(shell[2]),
+            script[script.index("&&") + 1 :],
             ["squeue", "--json", "--states=all", f"--user={username}"],
         )
+
+    @patch("sjobs.sjobs.shutil.which", return_value=None)
+    def test_remote_script_runs_in_a_real_shell(self, _which):
+        """Run the remote command through sh with a fake squeue on PATH."""
+        username = "alice; echo $(whoami) 'quoted' \"x\""
+        command = sjobs.build_cmdline(username=username, host="cluster")
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            args_file = Path(tmp) / "args"
+            fake = bin_dir / "squeue"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$@\" > {shlex.quote(str(args_file))}\n"
+                "printf '{\"jobs\": []}'\n"
+            )
+            fake.chmod(0o755)
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": tmp}
+            # ssh hands command[2] to the remote user's shell, like sh -c here.
+            result = subprocess.run(
+                ["sh", "-c", command[2]],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            homes, stdout = sjobs.split_remote_output(result.stdout)
+            self.assertEqual(homes, list(dict.fromkeys([tmp, str(Path(tmp).resolve())])))
+            self.assertEqual(sjobs.parse_squeue_json(stdout), [])
+            self.assertEqual(
+                args_file.read_text().splitlines(),
+                ["--json", "--states=all", f"--user={username}"],
+            )
 
 
     @patch("sjobs.sjobs.shutil.which", return_value="/usr/bin/squeue")
@@ -134,10 +169,36 @@ class ConfigTests(unittest.TestCase):
                 sjobs.load_config()
 
     def test_path_prefixes_include_home_and_config(self):
-        prefixes = sjobs.path_prefixes({"path_prefixes": ["/scratch", "/work/"]})
-        self.assertEqual(prefixes, [f"{Path.home()}/", "/scratch/", "/work/"])
+        config = {"path_prefixes": ["/scratch", "/work/"]}
+        prefixes = sjobs.path_prefixes(config, ["/home/alice", "/nfs/alice/", "/"])
+        self.assertEqual(prefixes, ["/home/alice/", "/nfs/alice/", "/scratch/", "/work/"])
+        self.assertEqual(sjobs.path_prefixes(config), ["/scratch/", "/work/"])
         self.assertEqual(sjobs.shorten_path("/work/a/b", prefixes), "a/b")
         self.assertEqual(sjobs.shorten_path("/other/a", prefixes), "/other/a")
+
+
+class RemoteOutputTests(unittest.TestCase):
+    def test_marker_lines_carry_logical_and_physical_home(self):
+        stdout = 'SJOBS_HOME=/home/alice\nSJOBS_HOME=/nfs/alice\n{"jobs": []}'
+        self.assertEqual(
+            sjobs.split_remote_output(stdout),
+            (["/home/alice", "/nfs/alice"], '{"jobs": []}'),
+        )
+
+    def test_profile_noise_before_the_markers_is_dropped(self):
+        stdout = (
+            "Welcome!\nSJOBS_HOME=/home/alice\r\nSJOBS_HOME=/home/alice\n"
+            '{"jobs": []}\n'
+        )
+        self.assertEqual(
+            sjobs.split_remote_output(stdout), (["/home/alice"], '{"jobs": []}\n')
+        )
+
+    def test_missing_marker_or_empty_home(self):
+        self.assertEqual(sjobs.split_remote_output('{"jobs": []}'), ([], '{"jobs": []}'))
+        self.assertEqual(
+            sjobs.split_remote_output("SJOBS_HOME=\nSJOBS_HOME=\n{}"), ([], "{}")
+        )
 
 
 class ParsingTests(unittest.TestCase):
@@ -442,6 +503,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 1)
         self.assertIn("did not finish within", result.output)
         self.assertEqual(run.call_args.kwargs["timeout"], sjobs.SQUEUE_TIMEOUT)
+
+    def test_version(self):
+        result = self.runner.invoke(sjobs.main, ["--version"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(f"version {version('sjobs')}", result.output)
+
+    @patch("sjobs.sjobs.subprocess.run")
+    def test_remote_home_is_stripped_and_local_home_is_not(self, run):
+        local = f"{Path.home()}/local-only"
+        payload = {
+            "jobs": [
+                {"job_state": ["RUNNING"], "current_working_directory": "/u/alice/run"},
+                {"job_state": ["RUNNING"], "current_working_directory": "/nfs/alice/phys"},
+                {"job_state": ["RUNNING"], "current_working_directory": local},
+            ]
+        }
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=f"SJOBS_HOME=/u/alice\nSJOBS_HOME=/nfs/alice\n{json.dumps(payload)}",
+        )
+        result = self.runner.invoke(sjobs.main, ["-H", "cluster"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn("/u/alice", result.output)
+        self.assertNotIn("/nfs/alice", result.output)
+        self.assertRegex(result.output, r"\n +phys\n")
+        self.assertRegex(result.output, r"\n +run\n")
+        self.assertIn(local, result.output)
 
     @patch("sjobs.sjobs.subprocess.run")
     def test_host_flag_overrides_env(self, run):
