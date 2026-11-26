@@ -24,7 +24,8 @@ sjobs                 # Your jobs
 sjobs --all           # All users' jobs
 sjobs --user alice    # One user's jobs (takes precedence over --all)
 sjobs -H mycluster    # Run squeue on an SSH host
-sjobs --watch         # Redraw every 60 s until Ctrl-C (--interval, at least 30 s)
+sjobs -c cwd,nodes    # Extra columns: cwd, nodes, partition, priority, or all
+sjobs --interval 120  # Refresh every 2 minutes (default 60 s, at least 30 s)
 sjobs --version       # Show the installed version
 python -m sjobs       # Also available as a Python module
 ```
@@ -44,7 +45,7 @@ on `PATH`. The host is anything `ssh` accepts, so aliases from `~/.ssh/config`
 work. On the remote side the Slurm tools run in a login shell (`sh -lc`), so `PATH`
 set in your profile applies. The same call first prints the remote home directory
 (both `$HOME` and its physical path, since Slurm records physical paths), so it is
-shortened in the CWD column without extra configuration. The default user filter
+shortened in paths without extra configuration. The default user filter
 applies to the account running `squeue`, which is your remote account when using
 SSH.
 
@@ -53,9 +54,17 @@ The config file is `$XDG_CONFIG_HOME/sjobs/config.toml` (default
 
 ```toml
 host = "mycluster"
-# Prefixes removed from the CWD column, in addition to your home directory
+# Prefixes removed from paths, in addition to your home directory
 # (local, or remote when using SSH).
 path_prefixes = ["/scratch/", "/mnt/nfs/home/"]
+# Optional columns to always show (same as --columns).
+columns = ["cwd", "nodes"]
+# Color theme of the interactive view. "auto" (the default) uses your
+# terminal's own colors, light or dark; any Textual theme name also works.
+theme = "auto"
+# GPU model names to look for in job constraints, if sjobs does not
+# recognize yours (a100, a40, l40s, h200, rtxpro6000 and similar are built in).
+gpu_types = ["bigcard"]
 ```
 
 Each invocation runs one shell script, locally or over a single SSH connection. It
@@ -65,15 +74,54 @@ controller. Only `squeue` is required: if `sshare` or `sprio` is missing or fail
 (for example on clusters without the multifactor priority plugin), sjobs prints a
 short note instead. A stuck connection or `squeue` is stopped after 60 seconds.
 
-`--watch` repeats this every `--interval` seconds (default 60, minimum 30) and
-redraws the screen; a failed refresh is shown and the next one is tried. Use it
-instead of `watch sjobs`, and avoid running it with `--all` for long, as that adds
-load on the Slurm controller.
+sjobs is an interactive view that repeats this every `--interval` seconds
+(default 60, minimum 30); a failed refresh is shown and the last tables are
+kept. It needs a terminal.
+
+| Key | Action |
+|---|---|
+| `↑` `↓`, `1` `2` `3` | move through the jobs (across tables), jump to running / pending / finished |
+| `Enter`, `d` | details of the selected job (`Enter` on an array row shows its tasks) |
+| `Space` | expand or fold the tasks of an array job |
+| `l` | the end of the selected job's output file (`e` switches to errors) |
+| `/`, `Esc` | filter by job ID, name, user, path, partition or reason; clear |
+| `o` | choose optional columns |
+| `a` | switch between your jobs and all users' jobs |
+| `r` | refresh now |
+| `c` | cancel the selected job with `scancel`, after asking `y`/`n` |
+| `?` | the keys and what sjobs's markers and colors mean |
+| `q` | quit |
+
+What else the view does:
+
+- **Status markers** start each row: `●` running (yellow near its time limit),
+  `○` pending, `!` held or waiting on something outside the queue, `✗` blocked
+  for good or failed, `✓` completed.
+- **Array jobs** fold into one row per array (`500_[1-3,7]  sweep ×4`) with the
+  total CPUs and memory and the average progress; `Space` shows the tasks.
+- **Tabs** replace the stacked tables when they do not fit the window, for
+  example with `--all`.
+- **Changes are announced**: when a job starts or ends between refreshes, a
+  notification names it (failures in red). With `desktop_notifications = true` in the config, sjobs also
+  asks the terminal for a desktop notification (OSC 9: iTerm2, Ghostty, WezTerm,
+  kitty and others).
+
+Reading a log (`l`) and cancelling (`c`) each run one extra command (`tail` or
+`scancel`) when you ask for them.
+
+The view takes its colors from your terminal: at startup it asks the terminal for
+its background, text color and 16-color palette and builds a theme from them, so
+it matches any light or dark terminal theme. Terminals that do not answer get
+Textual's light or dark theme. `Ctrl+P` offers other themes for the session, and
+`theme = "…"` in the config picks one permanently.
+
+Avoid leaving it on all users' jobs (`--all` or `a`) for long, as that adds load
+on the Slurm controller.
 
 ### Faster SSH
 
 Most of a remote run is spent setting up the SSH connection. Reusing one
-connection makes repeated runs (and every `--watch` refresh) nearly instant and
+connection makes every refresh nearly instant and
 avoids repeated logins on the cluster's login node:
 
 ```sshconfig
@@ -88,48 +136,58 @@ For older completed jobs, use `sacct`. See the
 
 ## Output
 
+A text rendering of the view:
+
 ```
-sjobs · mycluster · Wed 14:32   3 running (96 CPUs, 8 GPUs) · 5 pending · 1 other
-Fair share  ag_example  0.734  (usage 6.1% vs. 8.0% share)
+sjobs  mycluster   ● 2 running 33 CPUs · 132G · 4 GPUs   ○ 2 pending   · 1 finished   fair share 0.016 low   14:32
+! 812399 post: dependency failed (after 812350 ok); will never start
 
->>> RUNNING (3)
+Running  2
+   Job ID   Name      CPUs   Mem   GPUs              Progress            Left
+●  812345   md-run1     32  128G   4 x A100 (80GB)   ━─────────  13%   20h48m
+●  812346   prep         1    4G                     ━━━━━━━━━─  92%       9m
 
-  Job ID  Name     CWD          CPUs  GPUs      Nodes    Elapsed  Progress        Left  Ends
---------  -------  ---------  ------  --------  -------  -------  -------------  -----  --------------
-  812345  md-run1  proj/run1      32  4 x A100  gpu007     3h12m  ██░░░░░░  13%  20h48m  tomorrow 11:20
+Pending  2
+   Job ID   Name      CPUs   Mem   GPUs           Limit   Waiting   Starts    Why
+○  812398   md-run2     32  128G   1 x A100|A40   2d00h       35m   in 3h33m  behind higher-priority jobs
+✗  812399   post         4    8G                  1h00m       12m             dependency failed (after 812350 ok); will never start
+
+Finished & other  1
+   Job ID   Name    State    Exit   Ran     Ended    Log
+✗  812350   md-eq   failed      1   2h03m   4m ago   proj/logs/md-eq-812350.log
 ```
 
-The first line shows the host, the time, and job counts with the CPUs and GPUs
-held by running jobs. The fair share line comes from `sshare`: the value (green
-from 0.5, yellow from 0.2, red below) and your account's share of recent usage
-compared with its share of the allocation. With `--all` or `--user` it is labeled
-`user@account`, and the tables get a User column.
+What the view shows:
 
-Running jobs show elapsed time, progress against the time limit, time left and
-the end time. Pending jobs show how long ago they were submitted, the scheduler's
-estimated start (when the backfill scheduler has one), their priority, and the
-weighted factors that make up that priority as shares, e.g. `age 75% fs 20%
-part 5%` (age, fair share, job size, partition, QOS, TRES). Jobs that wait on a
-dependency are not ranked by `sprio`; for them, squeue's priority is shown without
-factors.
+- **Header.** Job counts, the CPUs, memory and GPUs your running jobs hold, and
+  your fair share as `sshare` reports it, with a verdict (good from 0.5, fair from
+  0.2, low below). Pending jobs that will never start without your help are listed
+  under it in red.
+- **Running.** Progress against the time limit and the time left; yellow from 90%,
+  because Slurm stops the job at its limit.
+- **Pending.** The requested time limit, how long the job has waited, the
+  scheduler's estimated start (`in 3h33m`, when it has one), and **Why** it waits, in words:
+  red needs your action, yellow waits on a hold or unavailable nodes.
+- **Finished & other.** Finished jobs stay in squeue for a few minutes. They show
+  how they ended (red for failed, timed out, out of memory), the exit code or
+  signal, the run time and the output file. For older jobs, use `sacct`.
+- **Optional columns** (`--columns`, `columns` in the config, `o` in the
+  interactive view): `cwd` (working directory), `nodes`, `partition`, and
+  `priority` (the priority of pending jobs with its weighted factors, e.g.
+  `17331 (partition 96%, fair share 2%, waiting time 1%)`). With `--all` or
+  `--user` the tables also get a User column.
 
-Each table header shows its job count, e.g. `>>> PENDING (12)`. Running jobs are
-sorted by end time (soonest first), pending jobs by priority (highest first, then
-oldest submission), and other jobs by job ID. In a terminal, columns such as CWD
-(down to 16 characters), Name, Nodes and Factors shrink so tables fit the window;
-when piped or redirected, CWD is capped at 56 characters and Name at 32.
+Running jobs are sorted by end time, pending jobs by priority (then submission),
+and finished jobs most recent first. Long job IDs, names, reasons and paths are cut to a maximum width; tables wider
+than the window scroll sideways (`←` `→` or the mouse). Paths have your home directory and any
+`path_prefixes` removed.
 
-Array tasks retain identifiers such as `1000_4` or `1000_[1-4]`. Heterogeneous
-jobs show the component as `1000+0`. Once GPUs are allocated, the GPUs column
-shows the job's total by allocated type (e.g. `1 x A100 (80GB)`), however they
-were requested (`--gpus`, `--gres=gpu:N`, …). Before allocation it shows the
-requests with their scope: per-job, per-node, per-socket, and per-task values,
-where `1 x GPU / node` means one GPU on each node and overlapping requests are
-displayed separately. Working directories have your home directory (on the
-machine running `squeue`) and any configured `path_prefixes` removed and are
-shortened from the left when needed.
-Times are shown relative to today (`today 18:05`, `Thu 09:12`) in the timezone
-of the computer running sjobs.
+Array tasks keep identifiers such as `1000_4` or `1000_[1-4]`, heterogeneous jobs
+show the component as `1000+0`. GPUs show the allocated models once a job runs
+(`1 x A100 (80GB)`), else the request with its scope (`1 x GPU / node`). A job
+that asks for an untyped `--gpus 1` and picks the model with `--constraint
+"a100|a40"` shows `1 x A100|A40`; a plain `1 x GPU` means any model. Times are
+relative to today (`today 18:05`, `Thu 09:12`) in your computer's timezone.
 
 ## Development
 

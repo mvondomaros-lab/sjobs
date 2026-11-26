@@ -49,6 +49,8 @@
       "job_id": 1200,
       "current_working_directory": "/scratch_shared/001234",
       "cpus": 2,
+      "tres_per_job": "gres/gpu:1",
+      "features": "a100|a40&ssd_2tb",
       "job_state": "PENDING",
       "partition": "batch",
       "state_reason": "Priority",

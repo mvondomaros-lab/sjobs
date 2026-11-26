@@ -1,6 +1,6 @@
 [project]
 name = "sjobs"
-version = "0.8"
+version = "0.9"
 authors = [
     { name = "Michael von Domaros", email = "mvondomaros@uni-marburg.de" }
 ]
@@ -12,7 +12,8 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "click>=8,<9",
-    "tabulate>=0.10,<0.11",
+    "rich>=13,<16",
+    "textual>=8,<9",
 ]
 
 [project.scripts]

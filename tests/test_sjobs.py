@@ -26,6 +26,7 @@ SNAPSHOT = (FIXTURES / "squeue.json").read_text()
 SSHARE = (FIXTURES / "sshare.txt").read_text()
 SPRIO = (FIXTURES / "sprio.txt").read_text()
 FIXTURE_PREFIXES = ["/scratch_shared/"]
+CWD = ("cwd",)
 # Six hours into the fixture's running job (12 h limit).
 NOW = 1794482019
 
@@ -37,6 +38,29 @@ def script_output(squeue=SNAPSHOT, sshare=SSHARE, sprio=SPRIO, homes=("/home/a",
         lines.append(f"{sjobs.SECTION_MARKER}{name}\n{text}")
     lines.append(f"{sjobs.SECTION_MARKER}squeue\n{squeue}")
     return "".join(lines)
+
+
+def fit_table(name, jobs, show_user=False, columns=()):
+    """A plain-text stand-in for the view's table, two spaces around cells."""
+    fields = sjobs.category_fields(name, show_user, columns)
+    jobs = sjobs.sort_jobs(name, jobs)
+    widths = sjobs.fit_widths(fields, jobs)
+    rows = [[header for _key, header in fields]] + [
+        [sjobs.cell(job, key, widths) for key, _header in fields] for job in jobs
+    ]
+    return "\n".join(
+        "".join(
+            f" {value:<{widths[key]}} "
+            for (key, _header), value in zip(fields, row, strict=True)
+        )
+        for row in rows
+    )
+
+
+def summary_text(snapshot, host=None, now=NOW, show_user=False):
+    """The summary text the view shows above the tables."""
+    grouped = sjobs.group_jobs(snapshot["jobs"])
+    return sjobs.render_summary(grouped, snapshot, host, now, show_user).plain
 
 
 def script_of(command):
@@ -208,6 +232,35 @@ class CommandTests(unittest.TestCase):
             self.assertIn(text, ctx.exception.message)
 
 
+class CancelTests(unittest.TestCase):
+    def test_scancel_local_and_over_ssh(self):
+        self.assertEqual(sjobs.build_scancel_cmdline("1234"), ["scancel", "1234"])
+        command = sjobs.build_scancel_cmdline("1100_[1-4]", host="cluster")
+        self.assertEqual(command[:2], ["ssh", "cluster"])
+        self.assertEqual(shlex.split(command[2]), ["sh", "-lc", "scancel '1100_[1-4]'"])
+        for job_id in ("12_3", "12+0", "12_[1,3-5%2]"):
+            with self.subTest(job_id=job_id):
+                self.assertEqual(sjobs.build_scancel_cmdline(job_id)[1], job_id)
+
+    @patch("sjobs.sjobs.subprocess.run")
+    def test_scancel_rejects_anything_but_a_job_id(self, run):
+        for job_id in ("1; rm -rf ~", "$(id)", "", "12 13", "-u bob", None):
+            with (
+                self.subTest(job_id=job_id),
+                self.assertRaises(click.ClickException),
+            ):
+                sjobs.run_scancel(job_id, host="cluster")
+        run.assert_not_called()
+
+    @patch("sjobs.sjobs.subprocess.run")
+    def test_scancel_errors_are_readable(self, run):
+        run.side_effect = subprocess.CalledProcessError(
+            1, [], output="", stderr="scancel: error: Kill job error: Access denied"
+        )
+        with self.assertRaisesRegex(click.ClickException, "Access denied"):
+            sjobs.run_scancel("1234", host="cluster")
+
+
 class ConfigTests(unittest.TestCase):
     def test_missing_config_is_empty(self):
         self.assertEqual(sjobs.load_config(), {})
@@ -240,6 +293,22 @@ class ConfigTests(unittest.TestCase):
                 self.assertRaisesRegex(click.ClickException, expected),
             ):
                 sjobs.load_config()
+
+    def test_columns_and_gpu_types_are_validated(self):
+        for text, message in (
+            ('columns = ["cwd", "colour"]', "unknown columns colour"),
+            ('columns = "cwd"', "'columns' must be a list"),
+            ("gpu_types = [1]", "'gpu_types' must be a list"),
+            ('desktop_notifications = "yes"', "must be true or false"),
+        ):
+            with (
+                self.subTest(text=text),
+                write_config(text),
+                self.assertRaisesRegex(click.ClickException, message),
+            ):
+                sjobs.load_config()
+        with write_config('columns = ["nodes"]\ngpu_types = ["bigcard"]'):
+            self.assertEqual(sjobs.load_config()["columns"], ["nodes"])
 
     def test_path_prefixes_include_home_and_config(self):
         config = {"path_prefixes": ["/scratch", "/work/"]}
@@ -289,15 +358,7 @@ class ExtraToolTests(unittest.TestCase):
         self.assertIsNone(problem)
         self.assertEqual(
             rows,
-            [
-                {
-                    "account": "acct_a",
-                    "user": "alice",
-                    "norm_shares": 0.2,
-                    "usage": 0.332631,
-                    "fairshare": 0.016209,
-                }
-            ],
+            [{"account": "acct_a", "user": "alice", "fairshare": 0.016209}],
         )
 
     def test_unusable_output_becomes_a_problem_not_an_error(self):
@@ -312,7 +373,8 @@ class ExtraToolTests(unittest.TestCase):
                 self.assertEqual(parse(None)[1], None)
         # Rows without a user (account lines) or with bad numbers are skipped.
         self.assertEqual(
-            sjobs.parse_sshare("acct||1|0.2|1|0.1|0.5\nacct|u|1|x|1|0.1|0.5\n")[0], []
+            sjobs.parse_sshare("acct||1|0.2|1|0.1|0.5\nacct|u|1|0.2|1|0.1|x\n")[0],
+            [],
         )
 
     def test_sprio_keeps_the_best_partition(self):
@@ -344,7 +406,7 @@ class ExtraToolTests(unittest.TestCase):
     def test_factor_shares_largest_first(self):
         self.assertEqual(
             sjobs.format_factors({"age": 100000, "fs": 62, "part": 33333, "qos": 0}),
-            "age 75% part 25%",
+            "waiting time 75%, partition 25%",
         )
         self.assertEqual(sjobs.format_factors({"age": 0, "fs": 0}), "")
 
@@ -383,9 +445,9 @@ class TimeTests(unittest.TestCase):
         self.assertEqual(sjobs.format_age(None, NOW), "")
 
     def test_progress_bar(self):
-        self.assertEqual(sjobs.progress_bar(0.25), "██░░░░░░  25%")
-        self.assertEqual(sjobs.progress_bar(1.5), "████████ 100%")
-        self.assertEqual(sjobs.progress_bar(-1), "░░░░░░░░   0%")
+        self.assertEqual(sjobs.progress_bar(0.3), "━━━───────  30%")
+        self.assertEqual(sjobs.progress_bar(1.5), "━━━━━━━━━━ 100%")
+        self.assertEqual(sjobs.progress_bar(-1), "──────────   0%")
 
     def test_time_limits(self):
         self.assertEqual(sjobs.time_limit_seconds(60), 3600)
@@ -468,7 +530,7 @@ class JobTests(unittest.TestCase):
         self.assertEqual(running["cpus"], "16")
         self.assertEqual(running["cwd"], "demo/run 01")
         self.assertEqual(pending["job_id"], "1100_[1-4]")
-        self.assertEqual(pending["dependency"], "afterok:1000_*")
+        self.assertEqual(pending["reason"], "waits for: after 1000_* ok")
         self.assertEqual(regular["job_id"], "1200")
         self.assertEqual(sjobs.classify_job(completing), "OTHER")
 
@@ -481,15 +543,21 @@ class JobTests(unittest.TestCase):
         self.assertEqual(running["name"], "md run")
         self.assertEqual(running["user"], "alice")
         self.assertEqual(running["elapsed"], "6h00m")
-        self.assertEqual(running["progress"], "████░░░░  50%")
+        self.assertEqual(running["progress"], "━━━━━───── 50%".replace(" ", "  "))
         self.assertEqual(running["time_left"], "6h00m")
         self.assertEqual(running["_cpus"], 16)
         self.assertEqual(running["_gpus"], 1)
-        self.assertEqual(queued["submitted"], "1h56m ago")
-        self.assertEqual(queued["est_start"], sjobs.format_when(1794485619, NOW))
+        self.assertEqual(queued["waiting"], "1h56m")
+        self.assertEqual(queued["mem"], "")
+        self.assertEqual(running["mem"], "16G")
+        self.assertEqual(queued["est_start"], "in 1h00m")
+        self.assertEqual(queued["est_start_at"], sjobs.format_when(1794485619, NOW))
+        self.assertEqual((running["glyph"], queued["glyph"]), ("●", "○"))
         # sprio's best partition wins over squeue's own priority.
-        self.assertEqual(queued["priority"], "5000")
-        self.assertEqual(queued["factors"], "fs 60% age 20% part 20%")
+        self.assertEqual(
+            queued["priority"],
+            "5000 (fair share 60%, waiting time 20%, partition 20%)",
+        )
         # Without sprio data, squeue's priority is shown and no factors.
         self.assertEqual(
             sjobs.normalize_job(sjobs.parse_squeue_json(SNAPSHOT)[2], now=NOW)[
@@ -638,6 +706,44 @@ class JobTests(unittest.TestCase):
         job["tres_per_task"] = "gres/gpu:1"
         self.assertEqual(sjobs.normalize_job(job)["gpus"], "1 x GPU / task")
 
+    def test_gpu_models_from_constraints(self):
+        for features, expected in (
+            ("a100|a40&ssd_2tb", ["a100", "a40"]),
+            ("[a100_80gb*2&l40s]", ["a100_80gb", "l40s"]),
+            ("zen2&ssd_2tb", []),
+            ("intel,h200,rtxpro6000", ["h200", "rtxpro6000"]),
+            ("A40|a40", ["a40"]),
+            ("", []),
+            (None, []),
+        ):
+            with self.subTest(features=features):
+                self.assertEqual(sjobs.gpu_types_from_features(features), expected)
+        self.assertEqual(
+            sjobs.gpu_types_from_features("bigcard&zen2", ["BigCard"]), ["bigcard"]
+        )
+
+    def test_untyped_requests_take_the_constraint_models(self):
+        job = {"tres_per_job": "gres/gpu:1", "features": "a100_80gb|a40&ssd_2tb"}
+        self.assertEqual(sjobs.normalize_job(job)["gpus"], "1 x A100 (80GB)|A40")
+        job = {"tres_per_node": "gres/gpu:2", "features": "bigcard"}
+        self.assertEqual(sjobs.normalize_job(job)["gpus"], "2 x GPU / node")
+        self.assertEqual(
+            sjobs.normalize_job(job, gpu_types=["bigcard"])["gpus"],
+            "2 x BIGCARD / node",
+        )
+        # A typed request or allocation is never overridden by the constraint.
+        typed = {"tres_per_job": "gres/gpu:h200:1", "features": "a40"}
+        self.assertEqual(sjobs.normalize_job(typed)["gpus"], "1 x H200")
+
+    def test_gres_detail_names_an_untyped_allocation(self):
+        job = {
+            "tres_alloc_str": "cpu=4,gres/gpu=3",
+            "gres_detail": ["gpu:a100:2(IDX:0-1)", "gpu:a100:1(IDX:3)"],
+        }
+        self.assertEqual(sjobs.normalize_job(job)["gpus"], "3 x A100")
+        job["gres_detail"] = ["gpu:2(IDX:0-1)"]
+        self.assertEqual(sjobs.normalize_job(job)["gpus"], "3 x GPU")
+
     def test_wrapped_and_scalar_timestamps(self):
         timestamp = 1794328380
         expected = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
@@ -726,18 +832,26 @@ class RenderTests(unittest.TestCase):
 
     def test_long_names_are_always_capped(self):
         job = sjobs.normalize_job({"job_id": 1, "name": "n" * 80})
-        self.assertIn(
-            "n" * (sjobs.MAX_NAME_WIDTH - 1) + "…", sjobs.fit_table("OTHER", [job])
-        )
-        self.assertNotIn("n" * sjobs.MAX_NAME_WIDTH, sjobs.fit_table("OTHER", [job]))
+        self.assertIn("n" * (sjobs.MAX_NAME_WIDTH - 1) + "…", fit_table("OTHER", [job]))
+        self.assertNotIn("n" * sjobs.MAX_NAME_WIDTH, fit_table("OTHER", [job]))
 
     def test_user_column_only_when_requested(self):
         job = sjobs.normalize_job({"job_id": 1, "name": "x", "user_name": "bob"})
-        self.assertNotIn("User", sjobs.fit_table("RUNNING", [job]))
-        table = sjobs.fit_table("RUNNING", [job], show_user=True)
+        self.assertNotIn("User", fit_table("RUNNING", [job]))
+        table = fit_table("RUNNING", [job], show_user=True)
         header = table.splitlines()[0].split()
         self.assertEqual(header[:4], ["Job", "ID", "Name", "User"])
         self.assertIn("bob", table)
+
+    def test_cwd_and_nodes_columns_are_opt_in(self):
+        job = self.running(1, 100, cwd="/x/somewhere")
+        job["nodes"] = "gpu07"
+        hidden = fit_table("RUNNING", [job])
+        self.assertNotIn("Path", hidden)
+        self.assertNotIn("gpu07", hidden)
+        shown = fit_table("RUNNING", [job], columns=("cwd", "nodes"))
+        self.assertIn("/x/somewhere", shown)
+        self.assertIn("gpu07", shown)
 
     def test_summary_counts_totals_and_fair_share(self):
         snapshot = {
@@ -748,218 +862,238 @@ class RenderTests(unittest.TestCase):
             "shares": sjobs.parse_sshare(SSHARE)[0],
             "problems": {"sshare": None, "sprio": None},
         }
-        frame = click.unstyle(sjobs.render_frame(snapshot, "cluster", NOW))
+        frame = click.unstyle(summary_text(snapshot, "cluster", NOW))
         first = frame.splitlines()[0]
-        self.assertIn("sjobs · cluster · ", first)
-        self.assertIn("1 running (16 CPUs, 1 GPU) · 2 pending · 1 other", first)
-        self.assertIn("Fair share  acct_a  0.016  (usage 33.3% vs. 20.0% share)", frame)
-        shown = sjobs.render_frame(snapshot, "cluster", NOW, show_user=True)
-        self.assertIn("alice@acct_a", click.unstyle(shown))
+        self.assertIn("sjobs  cluster", first)
+        self.assertIn(
+            "● 1 running 16 CPUs · 16G · 1 GPU   ○ 2 pending   · 1 finished", first
+        )
+        self.assertIn("fair share 0.016 low", first)
+        shown = summary_text(snapshot, "cluster", NOW, show_user=True)
+        self.assertIn("fair share 0.016", click.unstyle(shown))
 
-    def test_fair_share_colors(self):
+    def test_status_glyphs(self):
+        for state, reason, expected in (
+            ("RUNNING", None, "●"),
+            ("PENDING", "Priority", "○"),
+            ("PENDING", "JobHeldUser", "!"),
+            ("PENDING", "DependencyNeverSatisfied", "✗"),
+            ("COMPLETED", None, "✓"),
+            ("FAILED", None, "✗"),
+            ("CANCELLED", None, "!"),
+            ("COMPLETING", None, "·"),
+        ):
+            with self.subTest(state=state, reason=reason):
+                job = sjobs.normalize_job(
+                    {"job_state": [state], "state_reason": reason}, now=NOW
+                )
+                self.assertEqual(job["glyph"], expected)
+
+    def task(self, task_id, state="RUNNING", end=None, **extra):
+        return sjobs.normalize_job(
+            {
+                "job_id": 500 + task_id,
+                "array_job_id": 500,
+                "array_task_id": task_id,
+                "job_state": [state],
+                "name": "sweep",
+                "cpus": 2,
+                "tres_alloc_str": "cpu=2,mem=4G",
+                "start_time": NOW - 600,
+                "time_limit": 60,
+                "end_time": end or NOW + 3000,
+                **extra,
+            },
+            now=NOW,
+        )
+
+    def test_array_tasks_fold_into_one_row(self):
+        tasks = [self.task(i) for i in (1, 2, 3, 7)]
+        other = self.running(9, NOW + 100)
+        rows = sjobs.group_tasks("RUNNING", [*tasks, other])
+        self.assertEqual(len(rows), 2)
+        folded = rows[0]
+        self.assertEqual(folded["job_id"], "500_[1-3,7]")
+        self.assertEqual(folded["name"], "sweep ×4")
+        self.assertEqual((folded["cpus"], folded["mem"]), ("8", "16G"))
+        self.assertEqual(len(folded["_tasks"]), 4)
+        self.assertTrue(sjobs.CANCELABLE_JOB_ID_RE.fullmatch(folded["job_id"]))
+        # Expanded arrays keep one row per task.
+        self.assertEqual(len(sjobs.group_tasks("RUNNING", tasks, expanded={500})), 4)
+        # A single task stays as it is.
+        self.assertIs(sjobs.group_tasks("RUNNING", tasks[:1])[0], tasks[0])
+
+    def test_folded_finished_tasks_count_their_states(self):
+        tasks = [
+            self.task(1, "COMPLETED", end=NOW - 60),
+            self.task(2, "FAILED", end=NOW - 30),
+            self.task(3, "COMPLETED", end=NOW - 10),
+        ]
+        folded = sjobs.group_tasks("OTHER", sjobs.sort_jobs("OTHER", tasks))[0]
+        self.assertEqual(folded["state_label"], "2 completed, 1 failed")
+        self.assertEqual(folded["_severity"], "error")
+
+    def aligned(self):
+        running = [self.running(1, NOW + 100)]
+        running[0]["job_id"] = "11700351_[99-100]"
+        pending = [
+            sjobs.normalize_job(
+                {
+                    "job_id": 2,
+                    "name": "a-longer-name",
+                    "job_state": ["PENDING"],
+                    "state_reason": "PartitionTimeLimit",
+                },
+                now=NOW,
+            )
+        ]
+        finished = [
+            sjobs.normalize_job({"job_id": 3, "job_state": ["COMPLETED"]}, now=NOW)
+        ]
+        tables = {
+            name: (sjobs.category_fields(name), jobs)
+            for name, jobs in (
+                ("RUNNING", running),
+                ("PENDING", pending),
+                ("OTHER", finished),
+            )
+        }
+        return tables, sjobs.align_widths(tables)
+
+    def test_shared_leading_columns_line_up(self):
+        _tables, widths = self.aligned()
+        for key in ("glyph", "job_id", "name"):
+            self.assertEqual(len({widths[name][key] for name in widths}), 1, key)
+        self.assertEqual(widths["OTHER"]["job_id"], len("11700351_[99-100]"))
+        self.assertEqual(widths["PENDING"]["name"], len("a-longer-name"))
+        # Running and pending also share CPUs, Mem and GPUs; finished does not.
+        for key in ("cpus", "mem", "gpus"):
+            self.assertEqual(widths["RUNNING"][key], widths["PENDING"][key], key)
+        self.assertNotIn("cpus", widths["OTHER"])
+
+    def test_long_job_ids_are_capped(self):
+        self.assertEqual(sjobs.truncate_job_id("1000_[1-4]", 20), "1000_[1-4]")
+        self.assertEqual(sjobs.truncate_job_id("1000_[1,3,5,7,9]", 12), "1000_[1,3,…]")
+        self.assertEqual(sjobs.truncate_job_id("123456789", 5), "1234…")
+        job = {"job_id": "11676692_[18398,18410,18419-18420]"}
         self.assertEqual(
-            [sjobs.fairshare_color(v) for v in (0.9, 0.5, 0.3, 0.01)],
-            ["green", "green", "yellow", "red"],
+            sjobs.cell(job, "job_id", sjobs.CAPPED), "11676692_[18398,18…]"
+        )
+
+    def test_task_ranges(self):
+        self.assertEqual(sjobs.task_ranges([3, 1, 2, 7, 9, 10]), "1-3,7,9-10")
+        self.assertEqual(sjobs.task_ranges([4]), "4")
+
+    def test_changes_between_refreshes(self):
+        before = [
+            sjobs.normalize_job({"job_id": 1, "job_state": ["PENDING"]}, now=NOW),
+            sjobs.normalize_job({"job_id": 2, "job_state": ["RUNNING"]}, now=NOW),
+            sjobs.normalize_job({"job_id": 3, "job_state": ["RUNNING"]}, now=NOW),
+        ]
+        after = [
+            sjobs.normalize_job(
+                {"job_id": 1, "job_state": ["RUNNING"], "nodes": "gpu07"}, now=NOW
+            ),
+            sjobs.normalize_job(
+                {
+                    "job_id": 2,
+                    "job_state": ["FAILED"],
+                    "exit_code": {"return_code": 1},
+                },
+                now=NOW,
+            ),
+            sjobs.normalize_job({"job_id": 3, "job_state": ["RUNNING"]}, now=NOW),
+            sjobs.normalize_job({"job_id": 4, "job_state": ["PENDING"]}, now=NOW),
+            sjobs.normalize_job({"job_id": 5, "job_state": ["COMPLETED"]}, now=NOW),
+        ]
+        changes = sjobs.job_changes(before, after)
+        self.assertEqual(
+            [(job["job_id"], event, severity) for job, event, severity in changes],
+            [("1", "started", None), ("2", "ended", "error"), ("5", "ended", "ok")],
+        )
+        self.assertEqual(
+            [sjobs.describe_change(job, event) for job, event, _ in changes],
+            ["1 started on gpu07", "2 failed (exit 1)", "5 completed"],
+        )
+
+    def test_output_patterns_are_filled_in(self):
+        job = {
+            "job_id": 1701,
+            "array_job_id": 1700,
+            "array_task_id": 1,
+            "name": "md",
+            "user_name": "alice",
+            "nodes": "gpu[01-02]",
+            "standard_output": "/w/%x-%A_%3a.%J.%N.%u.%%.out",
+            "standard_error": "/w/plain.err",
+        }
+        self.assertEqual(
+            sjobs.output_path(job, "standard_output"),
+            "/w/md-1700_001.1701.gpu01.alice.%.out",
+        )
+        self.assertEqual(sjobs.output_path(job, "standard_error"), "/w/plain.err")
+        self.assertEqual(
+            sjobs.normalize_job(job)["_output"], "/w/md-1700_001.1701.gpu01.alice.%.out"
+        )
+
+    def test_relative_start(self):
+        self.assertEqual(sjobs.format_until(NOW + 3 * 3600 + 60, NOW), "in 3h01m")
+        self.assertEqual(sjobs.format_until(NOW + 30, NOW), "now")
+        self.assertEqual(sjobs.format_until(NOW - 30, NOW), "")
+        self.assertEqual(sjobs.format_until(None, NOW), "")
+
+    def test_fair_share_verdicts(self):
+        self.assertEqual(
+            [sjobs.fairshare_verdict(v)[0] for v in (0.9, 0.5, 0.3, 0.01)],
+            ["good", "good", "fair", "low"],
         )
 
     def test_missing_data_notes(self):
         pending = sjobs.normalize_job({"job_state": ["PENDING"]}, now=NOW)
         problems = {"sshare": "sshare not found", "sprio": "sprio not found"}
-        frame = sjobs.render_frame(
+        frame = summary_text(
             {"jobs": [pending], "shares": [], "problems": problems}, now=NOW
         )
         self.assertIn("fair share unavailable: sshare not found", frame)
         self.assertIn("priority factors unavailable: sprio not found", frame)
         # sprio complains when nothing is pending; that is not worth a note.
-        quiet = sjobs.render_frame(
-            {"jobs": [], "shares": [], "problems": problems}, now=NOW
-        )
+        quiet = summary_text({"jobs": [], "shares": [], "problems": problems}, now=NOW)
         self.assertNotIn("priority factors", quiet)
         self.assertIn("no jobs", quiet)
 
     def test_cwd_is_kept_whole_until_rendering(self):
         job = self.running(1, 100, cwd="/x/" + "d" * 80)
         self.assertEqual(len(job["cwd"]), 83)
-        table = sjobs.fit_table("RUNNING", [job])
+        table = fit_table("RUNNING", [job], columns=CWD)
         self.assertIn("…" + "d" * (sjobs.MAX_CWD_WIDTH - 1), table)
 
-    def test_table_shrinks_cwd_to_fit_the_terminal(self):
-        jobs = [self.running(1, 100, cwd="/x/" + "d" * 80)]
-        wide = max(map(len, sjobs.fit_table("RUNNING", jobs).splitlines()))
-        fitted = sjobs.fit_table("RUNNING", jobs, max_width=wide - 10)
-        self.assertEqual(max(map(len, fitted.splitlines())), wide - 10)
 
-    def test_cwd_never_shrinks_below_minimum(self):
-        jobs = [self.running(1, 100, cwd="/x/" + "d" * 80)]
-        fitted = sjobs.fit_table("RUNNING", jobs, max_width=10)
-        self.assertIn("…" + "d" * (sjobs.MIN_CWD_WIDTH - 1) + " ", fitted)
-
-    def test_long_job_ids_and_dependencies_shrink_widest_first(self):
-        job = sjobs.normalize_job(
-            {
-                "job_id": 1,
-                "array_job_id": 1000,
-                "array_task_string": ",".join(str(i) for i in range(2, 40, 3)),
-                "job_state": ["PENDING"],
-                "dependency": "afterany:2_*(unfulfilled),afterany:3_*(unfulfilled)",
-            },
-            [],
-        )
-        wide = sjobs.fit_table("PENDING", [job])
-        self.assertIn(job["job_id"], wide)
-        self.assertIn(job["dependency"], wide)
-        width = max(map(len, wide.splitlines())) - 40
-        fitted = sjobs.fit_table("PENDING", [job], max_width=width)
-        self.assertEqual(max(map(len, fitted.splitlines())), width)
-        self.assertRegex(fitted, r"1000_\[2,5,8,[0-9,]*…\]")
-        self.assertIn("afterany:2_*", fitted)
-        self.assertIn("…", fitted.splitlines()[-1].rstrip()[-1])
-
-    def test_job_id_truncation(self):
-        self.assertEqual(sjobs.truncate_job_id("1000_[1-4]", 20), "1000_[1-4]")
-        self.assertEqual(sjobs.truncate_job_id("1000_[1,3,5,7,9]", 12), "1000_[1,3,…]")
-        self.assertEqual(sjobs.truncate_job_id("123456789", 5), "1234…")
-
-    def test_short_tables_are_not_changed(self):
-        jobs = [self.running(1, 100)]
-        self.assertEqual(
-            sjobs.fit_table("RUNNING", jobs, max_width=500),
-            sjobs.fit_table("RUNNING", jobs),
-        )
-
-    @patch("sjobs.sjobs.sys.stdout")
-    def test_width_is_only_used_for_terminals(self, stdout):
-        stdout.isatty.return_value = False
-        self.assertIsNone(sjobs.terminal_width())
-        stdout.isatty.return_value = True
-        with patch("sjobs.sjobs.shutil.get_terminal_size") as size:
-            size.return_value = os.terminal_size((90, 40))
-            self.assertEqual(sjobs.terminal_width(), 90)
-
-
-class CliTests(unittest.TestCase):
+class FetchTests(unittest.TestCase):
     def setUp(self):
-        self.runner = CliRunner()
         which = patch("sjobs.sjobs.shutil.which", return_value="/usr/bin/squeue")
         which.start()
         self.addCleanup(which.stop)
 
     @patch("sjobs.sjobs.subprocess.run")
-    @patch("sjobs.sjobs.shutil.which", return_value=None)
-    def test_one_fetch_renders_all_categories_and_preserves_text(self, _which, run):
+    def test_one_process_with_one_squeue_call(self, run):
         run.return_value = subprocess.CompletedProcess([], 0, stdout=script_output())
-        config = 'host = "cluster"\npath_prefixes = ["/scratch_shared"]\n'
-        with write_config(config):
-            result = self.runner.invoke(sjobs.main)
-        self.assertEqual(result.exit_code, 0, result.output)
+        config = {"host": "cluster", "path_prefixes": ["/scratch_shared"]}
+        snapshot = sjobs.fetch_snapshot(host="cluster", config=config, now=NOW)
         # One process (one SSH round trip) with exactly one squeue call in it.
         run.assert_called_once()
         self.assertEqual(run.call_args.args[0][:2], ["ssh", "cluster"])
         self.assertEqual(script_of(run.call_args.args[0]).count("squeue --json"), 1)
-        for text in (
-            "sjobs · cluster · ",
-            "Fair share  acct_a  0.016",
-            "md run",
-            "fs 60% age 20% part 20%",
-            ">>> RUNNING (1)",
-            ">>> PENDING (2)",
-            ">>> OTHER (1)",
-            "1000_0",
-            "1100_[1-4]",
-            "1 x A100 (80GB)",
-            "COMPLETING",
-            "demo/run 01",
-            "001234",
-        ):
-            self.assertIn(text, result.output)
-
-    @patch("sjobs.sjobs.subprocess.run")
-    def test_empty_queue_is_successful(self, run):
-        run.return_value = subprocess.CompletedProcess([], 0, stdout='{"jobs": []}')
-        result = self.runner.invoke(sjobs.main)
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertNotIn(">>>", result.output)
-        self.assertIn("no jobs", result.output)
-
-    @patch("sjobs.sjobs.subprocess.run")
-    def test_all_users_adds_the_user_column(self, run):
-        run.return_value = subprocess.CompletedProcess([], 0, stdout=script_output())
-        result = self.runner.invoke(sjobs.main, ["--all"])
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("User", result.output)
-        self.assertIn("alice@acct_a", result.output)
-
-    @patch("sjobs.sjobs.time.sleep", side_effect=KeyboardInterrupt)
-    @patch("sjobs.sjobs.subprocess.run")
-    def test_watch_redraws_until_ctrl_c(self, run, sleep):
-        run.return_value = subprocess.CompletedProcess([], 0, stdout=script_output())
-        result = self.runner.invoke(sjobs.main, ["--watch"])
-        self.assertEqual(result.exit_code, 0, result.output)
-        run.assert_called_once()
-        sleep.assert_called_once_with(sjobs.DEFAULT_WATCH_INTERVAL)
-        self.assertEqual(result.output.count(">>> RUNNING"), 1)
-        self.assertIn("refreshing every 60 s · Ctrl-C to quit", result.output)
-
-    @patch("sjobs.sjobs.time.sleep", side_effect=[None, KeyboardInterrupt])
-    @patch("sjobs.sjobs.subprocess.run")
-    def test_watch_shows_errors_and_keeps_going(self, run, sleep):
-        run.side_effect = [
-            subprocess.CalledProcessError(255, ["ssh"], output="", stderr="timeout"),
-            subprocess.CompletedProcess([], 0, stdout=script_output()),
-        ]
-        result = self.runner.invoke(sjobs.main, ["-w", "--interval", "45"])
-        self.assertEqual(result.exit_code, 0, result.output)
+        jobs = {job["job_id"]: job for job in snapshot["jobs"]}
+        self.assertEqual(sorted(jobs), ["1000_0", "1100_[1-4]", "1200", "1300"])
+        self.assertEqual(jobs["1000_0"]["cwd"], "demo/run 01")
+        self.assertEqual(jobs["1200"]["cwd"], "001234")
+        self.assertEqual(jobs["1200"]["gpus"], "1 x A100|A40")
+        self.assertEqual(jobs["1300"]["state_label"], "completing")
         self.assertIn(
-            "Error: Failed to fetch jobs with `squeue`: timeout", result.output
+            "5000 (fair share 60%, waiting time 20%, partition 20%)",
+            jobs["1200"]["priority"],
         )
-        self.assertIn(">>> RUNNING", result.output)
-        self.assertEqual(sleep.call_args.args, (45,))
-
-    def test_watch_interval_has_a_minimum(self):
-        result = self.runner.invoke(sjobs.main, ["-w", "--interval", "5"])
-        self.assertEqual(result.exit_code, 2)
-        self.assertIn("--interval", result.output)
-
-    @patch("sjobs.sjobs.subprocess.run", side_effect=FileNotFoundError("ssh missing"))
-    def test_missing_executable_has_a_readable_error(self, _run):
-        result = self.runner.invoke(sjobs.main)
-        self.assertEqual(result.exit_code, 1)
-        self.assertIn("Error:", result.output)
-        self.assertIn("ssh missing", result.output)
-        self.assertNotIn("Traceback", result.output)
-
-    @patch("sjobs.sjobs.subprocess.run")
-    def test_command_error_prefers_stderr_and_falls_back_to_stdout(self, run):
-        for stderr, stdout, expected in (
-            ("permission denied", "other output", "permission denied"),
-            ("", "command unavailable", "command unavailable"),
-            (None, None, "unknown error"),
-        ):
-            with self.subTest(stderr=stderr, stdout=stdout):
-                run.side_effect = subprocess.CalledProcessError(
-                    1,
-                    ["squeue"],
-                    output=stdout,
-                    stderr=stderr,
-                )
-                result = self.runner.invoke(sjobs.main)
-                self.assertEqual(result.exit_code, 1)
-                self.assertIn(expected, result.output)
-
-    @patch(
-        "sjobs.sjobs.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(["squeue"], 60),
-    )
-    def test_hung_command_times_out_with_a_readable_error(self, run):
-        result = self.runner.invoke(sjobs.main)
-        self.assertEqual(result.exit_code, 1)
-        self.assertIn("did not finish within", result.output)
-        self.assertEqual(run.call_args.kwargs["timeout"], sjobs.SQUEUE_TIMEOUT)
-
-    def test_version(self):
-        result = self.runner.invoke(sjobs.main, ["--version"])
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn(f"version {version('sjobs')}", result.output)
+        self.assertEqual(snapshot["shares"][0]["account"], "acct_a")
 
     @patch("sjobs.sjobs.subprocess.run")
     def test_remote_home_is_stripped_and_local_home_is_not(self, run):
@@ -979,33 +1113,122 @@ class CliTests(unittest.TestCase):
             0,
             stdout=f"SJOBS_HOME=/u/alice\nSJOBS_HOME=/nfs/alice\n{json.dumps(payload)}",
         )
-        result = self.runner.invoke(sjobs.main, ["-H", "cluster"])
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertNotIn("/u/alice", result.output)
-        self.assertNotIn("/nfs/alice", result.output)
-        self.assertRegex(result.output, r"\n +phys\n")
-        self.assertRegex(result.output, r"\n +run\n")
-        self.assertIn(local, result.output)
+        snapshot = sjobs.fetch_snapshot(host="cluster")
+        self.assertEqual(
+            [job["cwd"] for job in snapshot["jobs"]], ["run", "phys", local]
+        )
+
+    @patch("sjobs.sjobs.subprocess.run", side_effect=FileNotFoundError("ssh missing"))
+    def test_missing_executable_has_a_readable_error(self, _run):
+        with self.assertRaisesRegex(click.ClickException, "ssh missing"):
+            sjobs.fetch_snapshot()
 
     @patch("sjobs.sjobs.subprocess.run")
-    def test_host_flag_overrides_env(self, run):
-        run.return_value = subprocess.CompletedProcess([], 0, stdout='{"jobs": []}')
-        with patch.dict(os.environ, {sjobs.HOST_ENV_VAR: "from-env"}):
-            result = self.runner.invoke(sjobs.main, ["-H", "from-flag"])
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(run.call_args.args[0][:2], ["ssh", "from-flag"])
+    def test_command_error_prefers_stderr_and_falls_back_to_stdout(self, run):
+        for stderr, stdout, expected in (
+            ("permission denied", "other output", "permission denied"),
+            ("", "command unavailable", "command unavailable"),
+            (None, None, "unknown error"),
+        ):
+            with self.subTest(stderr=stderr, stdout=stdout):
+                run.side_effect = subprocess.CalledProcessError(
+                    1,
+                    ["squeue"],
+                    output=stdout,
+                    stderr=stderr,
+                )
+                with self.assertRaisesRegex(click.ClickException, expected):
+                    sjobs.fetch_snapshot()
+
+    @patch(
+        "sjobs.sjobs.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(["squeue"], 60),
+    )
+    def test_hung_command_times_out_with_a_readable_error(self, run):
+        with self.assertRaisesRegex(click.ClickException, "did not finish within"):
+            sjobs.fetch_snapshot()
+        self.assertEqual(run.call_args.kwargs["timeout"], sjobs.SQUEUE_TIMEOUT)
 
     @patch("sjobs.sjobs.subprocess.run")
-    def test_invalid_response_reports_an_error_without_partial_tables(self, run):
+    def test_invalid_response_is_an_error(self, run):
         run.return_value = subprocess.CompletedProcess(
             [],
             0,
             stdout='{"jobs": [{"job_state": "RUNNING"}, null]}',
         )
-        result = self.runner.invoke(sjobs.main)
+        with self.assertRaises(click.ClickException):
+            sjobs.fetch_snapshot()
+
+
+class CliTests(unittest.TestCase):
+    """main only reads options and config, then starts the view."""
+
+    def setUp(self):
+        self.runner = CliRunner()
+        tty = patch("sjobs.sjobs.sys")
+        self.sys = tty.start()
+        self.addCleanup(tty.stop)
+        self.sys.stdin.isatty.return_value = True
+        self.sys.stdout.isatty.return_value = True
+        run_tui = patch("sjobs.tui.run_tui")
+        self.run_tui = run_tui.start()
+        self.addCleanup(run_tui.stop)
+
+    def invoke(self, *args):
+        result = self.runner.invoke(sjobs.main, list(args))
+        return result, self.run_tui.call_args.kwargs if self.run_tui.called else None
+
+    def test_defaults(self):
+        result, options = self.invoke()
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            options,
+            {
+                "show_all": False,
+                "username": None,
+                "host": None,
+                "config": {},
+                "interval": sjobs.DEFAULT_INTERVAL,
+                "columns": (),
+            },
+        )
+
+    def test_columns_come_from_the_option_and_config(self):
+        self.assertEqual(self.invoke("-c", "nodes")[1]["columns"], ("nodes",))
+        with write_config('columns = ["cwd"]'):
+            self.assertEqual(
+                self.invoke("--columns", "nodes")[1]["columns"], ("cwd", "nodes")
+            )
+        self.assertEqual(
+            self.invoke("-c", "all")[1]["columns"], tuple(sjobs.OPTIONAL_COLUMNS)
+        )
+        result = self.runner.invoke(sjobs.main, ["-c", "colour"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("unknown colour", result.output)
+
+    def test_host_flag_overrides_env(self):
+        with patch.dict(os.environ, {sjobs.HOST_ENV_VAR: "from-env"}):
+            self.assertEqual(self.invoke("-H", "from-flag")[1]["host"], "from-flag")
+            self.run_tui.reset_mock()
+            self.assertEqual(self.invoke()[1]["host"], "from-env")
+
+    def test_interval_has_a_minimum(self):
+        result = self.runner.invoke(sjobs.main, ["--interval", "5"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("--interval", result.output)
+        self.run_tui.assert_not_called()
+
+    def test_needs_a_terminal(self):
+        self.sys.stdout.isatty.return_value = False
+        result, _options = self.invoke()
         self.assertEqual(result.exit_code, 1)
-        self.assertIn("Error:", result.output)
-        self.assertNotIn(">>>", result.output)
+        self.assertIn("needs a terminal", result.output)
+        self.run_tui.assert_not_called()
+
+    def test_version(self):
+        result = self.runner.invoke(sjobs.main, ["--version"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(f"version {version('sjobs')}", result.output)
 
 
 if __name__ == "__main__":
