@@ -1,5 +1,6 @@
 """Offline tests of the interactive watcher, driven with Textual's Pilot."""
 
+import json
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -52,6 +53,18 @@ class TuiTests(AppTestCase):
             summary = str(app.query_one("#summary").render())
             self.assertIn("● 1 running 16 CPUs · 16G · 1 GPU", summary)
             self.assertNotIn("Path", self.headers(app, "RUNNING"))
+
+    async def test_q_quits_without_jobs(self):
+        # With every table hidden, focus must not stay on the hidden filter box.
+        empty = json.dumps({"jobs": [], "errors": [], "warnings": []})
+        self.run_mock.return_value = ok(script_output(squeue=empty))
+        app = tui.SjobsApp()
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(app, pilot)
+            self.assertEqual(self.row_counts(app), [0, 0, 0])
+            await pilot.press("q")
+            await pilot.pause()
+            self.assertFalse(app.is_running)
 
     async def test_columns_toggle(self):
         app = tui.SjobsApp(columns=("nodes",))
