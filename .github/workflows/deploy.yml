@@ -3,7 +3,7 @@ name: Build & Deploy
 # Branch pushes test and build (dry run); only a version tag (vX.Y) publishes.
 on:
   push:
-    branches: [ main, dev ]
+    branches: [ main ]
     tags: [ "v*" ]
   workflow_dispatch:
 

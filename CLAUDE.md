@@ -64,6 +64,6 @@ Each refresh starts exactly one process or SSH connection, which makes exactly o
 ## CI
 
 - `.github/workflows/test.yml` runs on pull requests and is reused by the deploy workflow. A lint job runs `pixi run lint`; the test job runs the tests on the oldest and newest supported Python, then checks `sjobs --help` and `python -m sjobs --help`.
-- `.github/workflows/deploy.yml` runs on pushes to `main` or `dev` and on `v*` tags: test, then build.
+- `.github/workflows/deploy.yml` runs on pushes to `main` and on `v*` tags: test, then build.
   - Branch pushes only do a dry run.
   - A `v*` tag must match `version` in `pyproject.toml`. It pushes the artifacts to the `mvondomaros-lab/mvondomaros-lab.github.io` pages repo and opens a PR there.
