@@ -851,6 +851,11 @@ class SjobsApp(App):
             if table.display:
                 table.focus()
                 return
+        # No table to focus (no jobs): focus nothing rather than leave it on
+        # a hidden widget, such as the filter box, that would swallow keys.
+        focused = self.focused
+        if focused is not None and not (focused.display and focused.visible):
+            self.set_focus(None)
 
     def selected_job(self, table=None):
         """The row under the cursor of the given (or the focused) table."""
